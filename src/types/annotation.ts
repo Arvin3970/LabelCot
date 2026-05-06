@@ -2,7 +2,7 @@ export type FieldType = 'checkbox' | 'text' | 'richtext';
 
 export type DataType = 'text' | 'image';
 
-export type LLMProviderType = 'openai' | 'ollama' | 'vllm' | 'custom';
+export type LLMProviderType = 'openai' | 'ollama' | 'vllm' | 'gpustack' | 'custom';
 
 export interface TemplateField {
   id: string;
@@ -98,6 +98,7 @@ export const LLM_PROVIDERS: LLMProvider[] = [
   { id: 'openai', name: 'OpenAI', defaultApiUrl: 'https://api.openai.com/v1', requiresApiKey: true },
   { id: 'ollama', name: 'Ollama', defaultApiUrl: 'http://localhost:11434/v1', requiresApiKey: false },
   { id: 'vllm', name: 'vLLM', defaultApiUrl: 'http://localhost:8000/v1', requiresApiKey: false },
+  { id: 'gpustack', name: 'GPUStack', defaultApiUrl: 'http://localhost:8080/v1', requiresApiKey: true },
   { id: 'custom', name: '自定义', defaultApiUrl: '', requiresApiKey: false },
 ];
 
@@ -105,6 +106,7 @@ export const VISION_MODEL_EXAMPLES: Record<LLMProviderType, string[]> = {
   openai: ['gpt-4o', 'gpt-4o-mini', 'gpt-4-turbo', 'gpt-4-vision-preview'],
   ollama: ['llava', 'bakllava', 'moondream', 'llava-llama3'],
   vllm: ['llava-hf/llava-1.5-7b-hf', 'Qwen/Qwen2-VL-7B-Instruct'],
+  gpustack: ['qwen3-vl-32b-instruct', 'llava-v1.6', 'qwen2-vl-7b-instruct'],
   custom: [],
 };
 
@@ -112,5 +114,6 @@ export const TEXT_MODEL_EXAMPLES: Record<LLMProviderType, string[]> = {
   openai: ['gpt-4o', 'gpt-4o-mini', 'gpt-4-turbo', 'gpt-3.5-turbo'],
   ollama: ['llama3', 'llama3.1', 'mistral', 'qwen2', 'deepseek-coder'],
   vllm: ['meta-llama/Llama-3-8b', 'Qwen/Qwen2-7B-Instruct'],
+  gpustack: ['qwen3-32b-instruct', 'llama-3-70b', 'deepseek-v3', 'mistral-large'],
   custom: [],
 };

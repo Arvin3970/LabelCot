@@ -1,9 +1,11 @@
 import React, { useState, useRef, useCallback, useEffect } from 'react';
+import { useLocation } from 'react-router-dom';
 import { 
   CheckCircle2Icon, Loader2Icon, ChevronLeftIcon, ChevronRightIcon, 
   FolderUpIcon, ImageIcon, FileIcon, FolderIcon, ChevronDownIcon, 
   ChevronRightIcon as TreeChevronIcon, PlusIcon, CheckSquareIcon, XIcon,
-  LayoutGridIcon, ListIcon, ZoomInIcon, ZoomOutIcon, SparklesIcon, FileJsonIcon
+  LayoutGridIcon, ListIcon, ZoomInIcon, ZoomOutIcon, SparklesIcon, FileJsonIcon,
+  DownloadIcon, UploadIcon
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
@@ -24,29 +26,30 @@ import LLMSettings from '@/components/LLMSettings';
 import { segmentImage, generateStructuredOutput } from '@/services/llm';
 import type { FileNode, DatasetItem, AnnotationResult, AnnotationTemplate, TemplateStorage, LLMConfig } from '@/types/annotation';
 
-const mockTemplates: AnnotationTemplate[] = [
-  { 
-    id: 't1', name: '情感极性分析', description: '文本情感分类', 
-    useLLM: true, dataType: 'text', 
-    fields: [{ id: 'f1', type: 'checkbox', label: '情感倾向', options: '正面,负面,中性' }],
-    createdAt: '2024-01-01'
-  },
-  { 
-    id: 't2', name: '图片分类标注', description: '图像内容分类', 
-    useLLM: true, dataType: 'image',
-    fields: [{ id: 'f1', type: 'checkbox', label: '图片类型', options: '人物,风景,物品,动物,其他' }],
-    createdAt: '2024-01-02'
-  },
-  { 
-    id: 't3', name: '实体识别', description: '文本实体提取', 
-    useLLM: true, dataType: 'text', 
-    fields: [
-      { id: 'f1', type: 'checkbox', label: '实体类型', options: '人名,地名,机构,时间' },
-      { id: 'f2', type: 'richtext', label: '备注' }
-    ],
-    createdAt: '2024-01-03'
-  },
-];
+const STORAGE_KEY = 'labelcot_templates';
+
+const loadTemplates = (): AnnotationTemplate[] => {
+  try {
+    const stored = localStorage.getItem(STORAGE_KEY);
+    if (stored) {
+      const templates = JSON.parse(stored);
+      return templates.map((t: any) => ({
+        id: t.id,
+        name: t.name,
+        description: t.desc,
+        dataType: t.dataType || 'text',
+        fields: t.fieldDetails || t.fields || [],
+        useLLM: t.llm || false,
+        llmConfigs: t.llmConfigs || [],
+        llmPrompts: t.llmPrompts || [],
+        createdAt: t.date || new Date().toISOString().slice(0, 10),
+      }));
+    }
+  } catch (error) {
+    console.error('Failed to load templates:', error);
+  }
+  return [];
+};
 
 const defaultLLMConfig: LLMConfig = {
   provider: 'ollama',
@@ -56,6 +59,8 @@ const defaultLLMConfig: LLMConfig = {
 };
 
 const Workspace: React.FC = () => {
+  const location = useLocation();
+  const [templates, setTemplates] = useState<AnnotationTemplate[]>([]);
   const [selectedTemplateId, setSelectedTemplateId] = useState<string>('');
   const [templateStorage, setTemplateStorage] = useState<TemplateStorage>({});
   const [showTemplateDialog, setShowTemplateDialog] = useState(false);
@@ -78,8 +83,43 @@ const Workspace: React.FC = () => {
   const [outputResult, setOutputResult] = useState<string>('');
   const [outputTemplate, setOutputTemplate] = useState<string>('将标注数据转换为JSON格式');
   const [showOutputDialog, setShowOutputDialog] = useState(false);
+  const annotationImportRef = useRef<HTMLInputElement>(null);
 
-  const selectedTemplate = mockTemplates.find(t => t.id === selectedTemplateId);
+  useEffect(() => {
+    const loadedTemplates = loadTemplates();
+    setTemplates(loadedTemplates);
+    
+    const state = location.state as any;
+    if (state?.templateId) {
+      const templateId = state.templateId;
+      setSelectedTemplateId(templateId);
+      setTemplateStorage(prev => ({
+        ...prev,
+        [templateId]: prev[templateId] || {
+          files: [],
+          items: [],
+          results: [],
+          currentIndex: 0
+        }
+      }));
+      
+      const template = loadedTemplates.find((t: AnnotationTemplate) => t.id === templateId);
+      if (template?.llmConfigs && template.llmConfigs.length > 0) {
+        setLlmConfig(template.llmConfigs[0]);
+      }
+    }
+  }, [location.state]);
+
+  useEffect(() => {
+    if (selectedTemplateId && templates.length > 0) {
+      const template = templates.find(t => t.id === selectedTemplateId);
+      if (template?.llmConfigs && template.llmConfigs.length > 0) {
+        setLlmConfig(template.llmConfigs[0]);
+      }
+    }
+  }, [selectedTemplateId, templates]);
+
+  const selectedTemplate = templates.find(t => t.id === selectedTemplateId);
   const currentStorage = selectedTemplateId ? templateStorage[selectedTemplateId] : null;
   const currentItem = currentStorage && currentStorage.items[currentStorage.currentIndex] || null;
   const totalItems = currentStorage?.items.length || 0;
@@ -131,7 +171,7 @@ const Workspace: React.FC = () => {
   }, [formData, selectedTemplateId]);
 
   const handleSelectTemplate = (templateId: string) => {
-    const template = mockTemplates.find(t => t.id === templateId);
+    const template = templates.find(t => t.id === templateId);
     if (!template) return;
 
     setSelectedTemplateId(templateId);
@@ -601,6 +641,83 @@ const Workspace: React.FC = () => {
     }
   };
 
+  const handleExportAnnotations = () => {
+    if (!currentStorage?.results.length) {
+      alert('没有已标注的数据可导出');
+      return;
+    }
+
+    const exportData = {
+      templateId: selectedTemplateId,
+      templateName: selectedTemplate?.name,
+      exportedAt: new Date().toISOString(),
+      items: currentStorage.items.map(item => ({
+        id: item.id,
+        fileName: item.fileName,
+        status: item.status,
+      })),
+      results: currentStorage.results,
+    };
+
+    const blob = new Blob([JSON.stringify(exportData, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `annotations_${selectedTemplate?.name || 'export'}_${new Date().toISOString().slice(0, 10)}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  const handleImportAnnotations = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const data = JSON.parse(e.target?.result as string);
+        
+        if (!data.templateId || !data.results) {
+          alert('导入失败：文件格式不正确');
+          return;
+        }
+
+        if (data.templateId !== selectedTemplateId) {
+          alert(`导入失败：模板不匹配（文件模板: ${data.templateName || data.templateId}）`);
+          return;
+        }
+
+        setTemplateStorage(prev => {
+          const existingResults = prev[selectedTemplateId]?.results || [];
+          const existingIds = new Set(existingResults.map(r => r.itemId));
+          
+          const newResults = data.results.filter((r: AnnotationResult) => !existingIds.has(r.itemId));
+          
+          return {
+            ...prev,
+            [selectedTemplateId]: {
+              ...prev[selectedTemplateId],
+              results: [...existingResults, ...newResults],
+              items: prev[selectedTemplateId].items.map(item => {
+                const hasResult = data.results.some((r: AnnotationResult) => r.itemId === item.id);
+                return hasResult ? { ...item, status: 'annotated' as const } : item;
+              }),
+            }
+          };
+        });
+
+        alert(`成功导入 ${data.results.length} 条标注数据`);
+      } catch (error) {
+        alert('导入失败：文件格式不正确');
+        console.error('Import error:', error);
+      }
+    };
+    reader.readAsText(file);
+    event.target.value = '';
+  };
+
   const renderFileTree = (nodes: FileNode[], depth: number = 0) => {
     return nodes.map(node => {
       const matchingItemIndex = node.type === 'file' 
@@ -671,32 +788,38 @@ const Workspace: React.FC = () => {
             </div>
 
             <div className="space-y-3 mb-6">
-              {mockTemplates.map(template => (
-                <Card 
-                  key={template.id}
-                  className={`cursor-pointer transition-all hover:border-primary/50 ${templateStorage[template.id]?.items.length ? 'border-green-500/50' : ''}`}
-                  onClick={() => handleSelectTemplate(template.id)}
-                >
-                  <CardContent className="p-4 flex items-center gap-4">
-                    <div className="w-10 h-10 rounded-lg bg-primary/10 flex items-center justify-center">
-                      {template.dataType === 'image' ? (
-                        <ImageIcon className="text-primary" size={20} />
-                      ) : (
-                        <FileIcon className="text-primary" size={20} />
-                      )}
-                    </div>
-                    <div className="flex-1">
-                      <h3 className="font-semibold">{template.name}</h3>
-                      <p className="text-sm text-muted-foreground">{template.description}</p>
-                    </div>
-                    {templateStorage[template.id]?.items.length ? (
-                      <span className="text-xs bg-green-100 text-green-700 px-2 py-1 rounded">
-                        {templateStorage[template.id].items.length} 条数据
-                      </span>
-                    ) : null}
-                  </CardContent>
-                </Card>
-              ))}
+              {templates.length === 0 ? (
+                <div className="text-center text-muted-foreground py-8">
+                  <p>暂无模板，请先创建模板</p>
+                </div>
+              ) : (
+                templates.map(template => (
+                  <Card 
+                    key={template.id}
+                    className={`cursor-pointer transition-all hover:border-primary/50 ${templateStorage[template.id]?.items.length ? 'border-green-500/50' : ''}`}
+                    onClick={() => handleSelectTemplate(template.id)}
+                  >
+                    <CardContent className="p-4 flex items-center gap-4">
+                      <div className="w-10 h-10 rounded-lg bg-primary/10 flex items-center justify-center">
+                        {template.dataType === 'image' ? (
+                          <ImageIcon className="text-primary" size={20} />
+                        ) : (
+                          <FileIcon className="text-primary" size={20} />
+                        )}
+                      </div>
+                      <div className="flex-1">
+                        <h3 className="font-semibold">{template.name}</h3>
+                        <p className="text-sm text-muted-foreground">{template.description}</p>
+                      </div>
+                      {templateStorage[template.id]?.items.length ? (
+                        <span className="text-xs bg-green-100 text-green-700 px-2 py-1 rounded">
+                          {templateStorage[template.id].items.length} 条数据
+                        </span>
+                      ) : null}
+                    </CardContent>
+                  </Card>
+                ))
+              )}
             </div>
 
             <div className="text-center text-sm text-muted-foreground">
@@ -717,7 +840,7 @@ const Workspace: React.FC = () => {
               <SelectValue placeholder="选择模板" />
             </SelectTrigger>
             <SelectContent>
-              {mockTemplates.map(t => (
+              {templates.map(t => (
                 <SelectItem key={t.id} value={t.id}>
                   {t.name} ({templateStorage[t.id]?.items.length || 0}条)
                 </SelectItem>
@@ -745,6 +868,37 @@ const Workspace: React.FC = () => {
                 <span className="text-muted-foreground">已保存</span>
               </>
             )}
+          </div>
+
+          <div className="h-4 w-[1px] bg-border" />
+
+          <div className="flex items-center gap-2">
+            <Button 
+              variant="outline" 
+              size="sm" 
+              className="h-8 gap-1"
+              onClick={handleExportAnnotations}
+              disabled={!currentStorage?.results.length}
+            >
+              <DownloadIcon size={14} />
+              导出标注
+            </Button>
+            <input
+              ref={annotationImportRef}
+              type="file"
+              accept=".json"
+              className="hidden"
+              onChange={handleImportAnnotations}
+            />
+            <Button 
+              variant="outline" 
+              size="sm" 
+              className="h-8 gap-1"
+              onClick={() => annotationImportRef.current?.click()}
+            >
+              <UploadIcon size={14} />
+              导入标注
+            </Button>
           </div>
 
           <div className="h-4 w-[1px] bg-border" />

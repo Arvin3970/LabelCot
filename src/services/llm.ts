@@ -1,3 +1,5 @@
+import OpenAI from 'openai';
+import type { ChatCompletionMessageParam } from 'openai/resources/chat/completions';
 import type { LLMConfig } from '@/types/annotation';
 
 export interface LLMMessage {
@@ -19,22 +21,72 @@ export interface LLMResponse {
   };
 }
 
+const PROXY_URL = 'http://localhost:3001/api/chat/completions';
+
+function getTargetUrl(config: LLMConfig): string {
+  let baseURL = config.apiUrl.trim();
+  
+  if (baseURL.endsWith('/v1/') || baseURL.endsWith('/v1')) {
+    // 已经包含 /v1
+  } else if (baseURL.endsWith('/')) {
+    baseURL = baseURL + 'v1';
+  } else {
+    baseURL = baseURL + '/v1';
+  }
+  
+  return `${baseURL}/chat/completions`;
+}
+
+function formatMessages(messages: LLMMessage[]): ChatCompletionMessageParam[] {
+  return messages.map(msg => {
+    if (typeof msg.content === 'string') {
+      return {
+        role: msg.role,
+        content: msg.content,
+      } as ChatCompletionMessageParam;
+    }
+    
+    return {
+      role: msg.role,
+      content: msg.content.map(part => {
+        if (part.type === 'text') {
+          return { type: 'text', text: part.text || '' };
+        }
+        return { type: 'image_url', image_url: part.image_url };
+      }),
+    } as ChatCompletionMessageParam;
+  });
+}
+
+async function callViaProxy(config: LLMConfig, body: Record<string, unknown>): Promise<any> {
+  const response = await fetch(PROXY_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      targetUrl: getTargetUrl(config),
+      apiKey: config.apiKey,
+      ...body,
+    }),
+  });
+
+  if (!response.ok) {
+    const error = await response.json();
+    throw new Error(error.error?.message || error.error || `HTTP ${response.status}`);
+  }
+
+  return response.json();
+}
+
 export async function callLLM(
   config: LLMConfig,
   messages: LLMMessage[],
   options?: { jsonMode?: boolean; maxTokens?: number }
 ): Promise<LLMResponse> {
-  const headers: Record<string, string> = {
-    'Content-Type': 'application/json',
-  };
-
-  if (config.apiKey) {
-    headers['Authorization'] = `Bearer ${config.apiKey}`;
-  }
-
   const body: Record<string, unknown> = {
     model: config.model,
-    messages,
+    messages: formatMessages(messages),
     max_tokens: options?.maxTokens || 4096,
   };
 
@@ -42,22 +94,14 @@ export async function callLLM(
     body.response_format = { type: 'json_object' };
   }
 
-  const response = await fetch(`${config.apiUrl}/chat/completions`, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(body),
-  });
+  const data = await callViaProxy(config, body);
 
-  if (!response.ok) {
-    const error = await response.text();
-    throw new Error(`LLM API error: ${response.status} - ${error}`);
-  }
-
-  const data = await response.json();
-  
   return {
     content: data.choices[0]?.message?.content || '',
-    usage: data.usage,
+    usage: data.usage ? {
+      prompt_tokens: data.usage.prompt_tokens,
+      completion_tokens: data.usage.completion_tokens,
+    } : undefined,
   };
 }
 
@@ -111,13 +155,18 @@ export async function generateStructuredOutput(
   return response.content;
 }
 
-export async function testConnection(config: LLMConfig): Promise<boolean> {
+export async function testConnection(config: LLMConfig): Promise<{ success: boolean; error?: string }> {
   try {
-    const response = await callLLM(config, [
-      { role: 'user', content: 'Say "OK" if you can hear me.' },
-    ], { maxTokens: 10 });
-    return response.content.toLowerCase().includes('ok');
-  } catch {
-    return false;
+    const body: Record<string, unknown> = {
+      model: config.model,
+      messages: [{ role: 'user', content: 'Hello' }],
+      max_tokens: 5,
+    };
+
+    const data = await callViaProxy(config, body);
+
+    return { success: !!(data.choices && data.choices.length > 0) };
+  } catch (error: any) {
+    return { success: false, error: error.message || '网络请求失败' };
   }
 }

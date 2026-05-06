@@ -1,5 +1,5 @@
-import React, { useState, useRef } from 'react';
-import { useNavigate } from 'react-router-dom';
+import React, { useState, useRef, useEffect } from 'react';
+import { useNavigate, useLocation } from 'react-router-dom';
 import { SaveIcon, PlusIcon, BotIcon, Trash2Icon, GripVerticalIcon, FileTextIcon, ImageIcon, EyeIcon, CheckCircle2Icon, XCircleIcon, Loader2Icon, SettingsIcon, MessageSquareIcon, DownloadIcon, UploadIcon } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -14,12 +14,37 @@ import { TemplateField, FieldType, DataType, LLMConfig, LLMProviderType, LLMProm
 import { LLM_PROVIDERS } from '@/types/annotation';
 import { testConnection } from '@/services/llm';
 
+const STORAGE_KEY = 'labelcot_templates';
+
+const loadTemplates = () => {
+  try {
+    const stored = localStorage.getItem(STORAGE_KEY);
+    if (stored) {
+      return JSON.parse(stored);
+    }
+  } catch (error) {
+    console.error('Failed to load templates from localStorage:', error);
+  }
+  return [];
+};
+
+const saveTemplates = (templates: any[]) => {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(templates));
+  } catch (error) {
+    console.error('Failed to save templates to localStorage:', error);
+  }
+};
+
 const TemplateBuilder: React.FC = () => {
   console.log('TemplateBuilder rendered: Constructing new template');
   const navigate = useNavigate();
+  const location = useLocation();
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  const [editingTemplateId, setEditingTemplateId] = useState<string | null>(null);
   const [templateName, setTemplateName] = useState('');
+  const [description, setDescription] = useState('');
   const [dataType, setDataType] = useState<DataType>('text');
   const [useLLM, setUseLLM] = useState(false);
   const [llmConfigs, setLlmConfigs] = useState<LLMConfig[]>([]);
@@ -27,6 +52,22 @@ const TemplateBuilder: React.FC = () => {
   const [fields, setFields] = useState<TemplateField[]>([
     { id: 'f1', type: 'checkbox', label: '情感极性', options: '正面, 负面, 中性' }
   ]);
+
+  useEffect(() => {
+    const state = location.state as any;
+    if (state?.template) {
+      const t = state.template;
+      setEditingTemplateId(t.id);
+      setTemplateName(t.name.replace(' (副本)', ''));
+      setDescription(t.desc || '');
+      setDataType(t.dataType || 'text');
+      setUseLLM(t.llm || false);
+      const loadedFields = t.fieldDetails || t.fields;
+      setFields(loadedFields && loadedFields.length > 0 ? loadedFields : [{ id: 'f1', type: 'checkbox', label: '情感极性', options: '正面, 负面, 中性' }]);
+      setLlmConfigs(t.llmConfigs && t.llmConfigs.length > 0 ? t.llmConfigs : []);
+      setLlmPrompts(t.llmPrompts && t.llmPrompts.length > 0 ? t.llmPrompts : []);
+    }
+  }, [location.state]);
 
   const [showAddModelDialog, setShowAddModelDialog] = useState(false);
   const [editingConfigIndex, setEditingConfigIndex] = useState<number | null>(null);
@@ -38,6 +79,7 @@ const TemplateBuilder: React.FC = () => {
   });
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<'success' | 'failed' | null>(null);
+  const [testError, setTestError] = useState<string>('');
   
   const [showAddPromptDialog, setShowAddPromptDialog] = useState(false);
   const [editingPromptIndex, setEditingPromptIndex] = useState<number | null>(null);
@@ -78,6 +120,7 @@ const TemplateBuilder: React.FC = () => {
       });
     }
     setTestResult(null);
+    setTestError('');
     setShowAddModelDialog(true);
   };
 
@@ -91,13 +134,43 @@ const TemplateBuilder: React.FC = () => {
       apiKey: provider.requiresApiKey ? (prev.apiKey || '') : undefined,
     }));
     setTestResult(null);
+    setTestError('');
   };
 
   const handleTestConnection = async () => {
+    if (!tempConfig.apiUrl || !tempConfig.model) {
+      setTestResult('failed');
+      setTestError('请填写API地址和模型名称');
+      return;
+    }
+
     setTesting(true);
     setTestResult(null);
+    setTestError('');
+    
     const result = await testConnection(tempConfig);
-    setTestResult(result ? 'success' : 'failed');
+    
+    if (result.success) {
+      setTestResult('success');
+    } else {
+      setTestResult('failed');
+      let errorMsg = result.error || '连接失败';
+      
+      if (errorMsg.includes('CORS') || errorMsg.includes('跨域')) {
+        const providerName = LLM_PROVIDERS.find(p => p.id === tempConfig.provider)?.name || tempConfig.provider;
+        errorMsg = `跨域错误(CORS)：${providerName} 服务不允许跨域请求。\n\n解决方案：\n`;
+        
+        if (tempConfig.provider === 'vllm') {
+          errorMsg += '启动 vLLM 时添加参数: --allow-origin "*"';
+        } else if (tempConfig.provider === 'ollama') {
+          errorMsg += '设置环境变量: OLLAMA_ORIGINS="*" 后重启 Ollama';
+        } else {
+          errorMsg += '请在服务端配置允许跨域请求';
+        }
+      }
+      
+      setTestError(errorMsg);
+    }
     setTesting(false);
   };
 
@@ -144,12 +217,69 @@ const TemplateBuilder: React.FC = () => {
   };
 
   const handleSave = () => {
-    console.log('Saving template:', { templateName, dataType, useLLM, llmConfigs, llmPrompts, fields });
+    if (!templateName.trim()) {
+      alert('请输入模板名称');
+      return;
+    }
+    
+    const templates = loadTemplates();
+    const newTemplate = {
+      id: editingTemplateId || Date.now().toString(),
+      name: templateName,
+      desc: description,
+      llm: useLLM,
+      fields: fields.length,
+      date: new Date().toISOString().slice(0, 10),
+      dataType,
+      fieldDetails: fields,
+      llmConfigs,
+      llmPrompts,
+      status: 'draft',
+    };
+
+    const existingIndex = templates.findIndex((t: any) => t.id === newTemplate.id);
+    if (existingIndex >= 0) {
+      templates[existingIndex] = newTemplate;
+    } else {
+      templates.push(newTemplate);
+    }
+
+    saveTemplates(templates);
+    console.log('Saving template:', newTemplate);
     alert('模板已保存为草稿！');
+    navigate('/templates');
   };
 
   const handlePublish = () => {
-    console.log('Publishing template:', { templateName, dataType, useLLM, llmConfigs, llmPrompts, fields });
+    if (!templateName.trim()) {
+      alert('请输入模板名称');
+      return;
+    }
+    
+    const templates = loadTemplates();
+    const newTemplate = {
+      id: editingTemplateId || Date.now().toString(),
+      name: templateName,
+      desc: description,
+      llm: useLLM,
+      fields: fields.length,
+      date: new Date().toISOString().slice(0, 10),
+      dataType,
+      fieldDetails: fields,
+      llmConfigs,
+      llmPrompts,
+      status: 'published',
+    };
+
+    const existingIndex = templates.findIndex((t: any) => t.id === newTemplate.id);
+    if (existingIndex >= 0) {
+      templates[existingIndex] = newTemplate;
+    } else {
+      templates.push(newTemplate);
+    }
+
+    saveTemplates(templates);
+    console.log('Publishing template:', newTemplate);
     alert('模板已发布！可以前往工作台使用。');
     navigate('/templates');
   };
@@ -190,8 +320,9 @@ const TemplateBuilder: React.FC = () => {
       try {
         const template = JSON.parse(e.target?.result as string) as AnnotationTemplate;
         setTemplateName(template.name);
+        setDescription(template.description || '');
         setDataType(template.dataType);
-        setFields(template.fields || []);
+        setFields(template.fields || [{ id: 'f1', type: 'checkbox', label: '情感极性', options: '正面, 负面, 中性' }]);
         setUseLLM(template.useLLM || false);
         setLlmConfigs(template.llmConfigs || []);
         setLlmPrompts(template.llmPrompts || []);
@@ -244,6 +375,16 @@ const TemplateBuilder: React.FC = () => {
                 placeholder="例如：通用实体识别模板" 
                 value={templateName}
                 onChange={(e) => setTemplateName(e.target.value)}
+              />
+            </div>
+            
+            <div className="space-y-2">
+              <Label htmlFor="desc">模板描述</Label>
+              <Input 
+                id="desc" 
+                placeholder="简要描述模板用途" 
+                value={description}
+                onChange={(e) => setDescription(e.target.value)}
               />
             </div>
             
@@ -439,24 +580,31 @@ const TemplateBuilder: React.FC = () => {
                   </label>
                 </div>
 
-                <div className="flex items-center gap-2">
-                  <Button variant="outline" size="sm" onClick={handleTestConnection} disabled={testing || !tempConfig.apiUrl || !tempConfig.model}>
-                    {testing ? (
-                      <>
-                        <Loader2Icon className="animate-spin mr-2" size={14} />
-                        测试中...
-                      </>
-                    ) : '测试连接'}
-                  </Button>
-                  {testResult === 'success' && (
-                    <span className="flex items-center gap-1 text-green-600 text-sm">
-                      <CheckCircle2Icon size={14} /> 连接成功
-                    </span>
-                  )}
-                  {testResult === 'failed' && (
-                    <span className="flex items-center gap-1 text-red-600 text-sm">
-                      <XCircleIcon size={14} /> 连接失败
-                    </span>
+                <div className="flex flex-col gap-2">
+                  <div className="flex items-center gap-2">
+                    <Button variant="outline" size="sm" onClick={handleTestConnection} disabled={testing || !tempConfig.apiUrl || !tempConfig.model}>
+                      {testing ? (
+                        <>
+                          <Loader2Icon className="animate-spin mr-2" size={14} />
+                          测试中...
+                        </>
+                      ) : '测试连接'}
+                    </Button>
+                    {testResult === 'success' && (
+                      <span className="flex items-center gap-1 text-green-600 text-sm">
+                        <CheckCircle2Icon size={14} /> 连接成功
+                      </span>
+                    )}
+                    {testResult === 'failed' && (
+                      <span className="flex items-center gap-1 text-red-600 text-sm">
+                        <XCircleIcon size={14} /> 连接失败
+                      </span>
+                    )}
+                  </div>
+                  {testError && testResult === 'failed' && (
+                    <p className="text-xs text-red-500 bg-red-50 p-2 rounded border border-red-200">
+                      {testError}
+                    </p>
                   )}
                 </div>
               </div>
