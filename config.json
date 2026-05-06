@@ -1,0 +1,23 @@
+{
+  "routes": [
+    {
+      "path": "/",
+      "src": "src/pages/Dashboard.tsx"
+    },
+    {
+      "path": "/templates",
+      "src": "src/pages/Templates.tsx"
+    },
+    {
+      "path": "/template-builder",
+      "src": "src/pages/TemplateBuilder.tsx"
+    },
+    {
+      "path": "/workspace",
+      "src": "src/pages/Workspace.tsx"
+    }
+  ],
+  "components": [
+    {"name": "Header", "src": "src/components/Header.tsx"}
+  ]
+}
