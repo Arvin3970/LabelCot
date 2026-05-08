@@ -4,8 +4,8 @@ import {
   CheckCircle2Icon, Loader2Icon, ChevronLeftIcon, ChevronRightIcon, 
   FolderUpIcon, ImageIcon, FileIcon, FolderIcon, ChevronDownIcon, 
   ChevronRightIcon as TreeChevronIcon, PlusIcon, CheckSquareIcon, XIcon,
-  LayoutGridIcon, ListIcon, ZoomInIcon, ZoomOutIcon, SparklesIcon, FileJsonIcon,
-  DownloadIcon, UploadIcon, BotIcon
+  ZoomInIcon, ZoomOutIcon, SparklesIcon, FileJsonIcon,
+  DownloadIcon, UploadIcon, BotIcon, CircleIcon, SquareIcon, MinusIcon, Trash2Icon
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
@@ -17,13 +17,14 @@ import {
 } from '@/components/ui/select';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { 
-  Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger, DialogFooter 
+  Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger, DialogFooter, DialogDescription
 } from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
 import { Progress } from '@/components/ui/progress';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import LLMSettings from '@/components/LLMSettings';
 import { segmentImage, generateStructuredOutput, callLLM } from '@/services/llm';
+import { saveImage, getImage, deleteImagesByPrefix } from '@/utils/imageStorage';
 import type { FileNode, DatasetItem, AnnotationResult, AnnotationTemplate, TemplateStorage, LLMConfig } from '@/types/annotation';
 
 const STORAGE_KEY = 'labelcot_templates';
@@ -31,15 +32,32 @@ const WORKSPACE_STATE_KEY = 'labelcot_workspace_state';
 const WORKSPACE_FILES_KEY = 'labelcot_workspace_files';
 const WORKSPACE_TEMPLATE_ID_KEY = 'labelcot_workspace_template_id';
 
+interface DrawAnnotation {
+  id: string;
+  type: 'point' | 'rect' | 'line';
+  points: number[];
+  order: number;
+  pointSize?: number;
+}
+
 interface WorkspacePersistState {
   formData: Record<string, string | string[]>;
   segmentPromptOverride: string;
   cotPromptOverride: string;
   segmentAnnotations: Array<{ label: string; bbox?: [number, number, number, number]; confidence?: number }>;
+  drawAnnotations: DrawAnnotation[];
   segmentError: string;
   cotError: string;
   lastItemId: string | null;
   savedAt: string;
+}
+
+interface FileNodeData {
+  id: string;
+  name: string;
+  type: 'file' | 'folder';
+  path: string;
+  children?: FileNodeData[];
 }
 
 interface WorkspaceFilesState {
@@ -47,6 +65,7 @@ interface WorkspaceFilesState {
   items: DatasetItem[];
   results: AnnotationResult[];
   currentIndex: number;
+  fileNodes: FileNodeData[];
   savedAt: string;
 }
 
@@ -77,14 +96,62 @@ const loadWorkspaceState = (templateId: string, itemId: string): WorkspacePersis
   }
 };
 
-const saveWorkspaceFiles = (templateId: string, data: { items: DatasetItem[]; results: AnnotationResult[]; currentIndex: number }) => {
+const flattenAllNodes = (nodes: FileNode[]): FileNode[] => {
+  const result: FileNode[] = [];
+  for (const node of nodes) {
+    result.push(node);
+    if (node.children) {
+      result.push(...flattenAllNodes(node.children));
+    }
+  }
+  return result;
+};
+
+const flattenFileNodes = (nodes: FileNode[]): FileNode[] => {
+  const result: FileNode[] = [];
+  for (const node of nodes) {
+    if (node.type === 'file') {
+      result.push(node);
+    } else if (node.children) {
+      result.push(...flattenFileNodes(node.children));
+    }
+  }
+  return result;
+};
+
+const saveWorkspaceFiles = async (templateId: string, data: { items: DatasetItem[]; results: AnnotationResult[]; currentIndex: number; fileNodes: FileNode[] }) => {
   try {
     const allFiles = JSON.parse(localStorage.getItem(WORKSPACE_FILES_KEY) || '{}');
+    const allNodes = flattenAllNodes(data.fileNodes);
+    const serializeFileNodes = (nodes: FileNode[]): FileNodeData[] => {
+      return nodes.map(node => ({
+        id: node.id,
+        name: node.name,
+        type: node.type,
+        path: node.path,
+      }));
+    };
+    
+    for (const item of data.items) {
+      if (item.imageData) {
+        await saveImage(item.id, item.imageData);
+      }
+    }
+    
+    const serializedItems = data.items.map(item => ({
+      id: item.id,
+      fileName: item.fileName,
+      status: item.status,
+      templateId: item.templateId,
+      textContent: item.textContent,
+    }));
+    
     allFiles[templateId] = {
       templateId,
-      items: data.items,
+      items: serializedItems,
       results: data.results,
       currentIndex: data.currentIndex,
+      fileNodes: serializeFileNodes(allNodes),
       savedAt: new Date().toISOString(),
     };
     localStorage.setItem(WORKSPACE_FILES_KEY, JSON.stringify(allFiles));
@@ -159,7 +226,6 @@ const Workspace: React.FC = () => {
   const [templateStorage, setTemplateStorage] = useState<TemplateStorage>({});
   const [showTemplateDialog, setShowTemplateDialog] = useState(false);
   const [newTemplateName, setNewTemplateName] = useState('');
-  const [viewMode, setViewMode] = useState<'grid' | 'list'>('grid');
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set());
   const [imageZoom, setImageZoom] = useState(1);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -179,59 +245,153 @@ const Workspace: React.FC = () => {
   const imageCanvasRef = useRef<HTMLCanvasElement>(null);
   const [imageDimensions, setImageDimensions] = useState<{ width: number; height: number }>({ width: 0, height: 0 });
   
+  const [drawTool, setDrawTool] = useState<'point' | 'rect' | 'line' | 'none'>('none');
+  const [drawAnnotations, setDrawAnnotations] = useState<Array<{
+    id: string;
+    type: 'point' | 'rect' | 'line';
+    points: number[];
+    order: number;
+    pointSize?: number;
+  }>>([]);
+  const [isDrawing, setIsDrawing] = useState(false);
+  const [drawStart, setDrawStart] = useState<{ x: number; y: number } | null>(null);
+  const [pointSize, setPointSize] = useState<number>(6);
+  const [showPointSizeSettings, setShowPointSizeSettings] = useState<boolean>(false);
+  const pointSizeRef = useRef<HTMLDivElement>(null);
+  const drawCanvasRef = useRef<HTMLCanvasElement>(null);
+  
   const [cotLoading, setCotLoading] = useState(false);
   const [cotError, setCotError] = useState<string>('');
   
   const [globalSegmentPromptOverride, setGlobalSegmentPromptOverride] = useState<string>('');
   const [globalCOTPromptOverride, setGlobalCOTPromptOverride] = useState<string>('');
+  const [duplicateFiles, setDuplicateFiles] = useState<string[]>([]);
+  const [showDuplicateDialog, setShowDuplicateDialog] = useState(false);
+  const [pendingFiles, setPendingFiles] = useState<File[]>([]);
+  const [deleteConfirmFolder, setDeleteConfirmFolder] = useState<string | null>(null);
+  const [deleteFolderName, setDeleteFolderName] = useState<string>('');
   
-  const annotationImportRef = useRef<HTMLInputElement>(null);
+const annotationImportRef = useRef<HTMLInputElement>(null);
+
+const buildTreeFromNodes = (nodes: FileNodeData[]): FileNode[] => {
+  const root: FileNode = { id: '', name: '', type: 'folder', path: '', children: [] };
+  const map = new Map<string, FileNode>();
+  map.set('', root);
+
+  const sortedNodes = [...nodes].sort((a, b) => {
+    const aDepth = a.path.split('/').length;
+    const bDepth = b.path.split('/').length;
+    return aDepth - bDepth;
+  });
+
+  for (const node of sortedNodes) {
+    const fileNode: FileNode = {
+      id: node.id,
+      name: node.name,
+      type: node.type,
+      path: node.path,
+      children: node.type === 'folder' ? [] : undefined,
+    };
+    map.set(node.path, fileNode);
+
+    const parentPath = node.path.split('/').slice(0, -1).join('/');
+    const parent = map.get(parentPath) || root;
+    if (parent.children) {
+      parent.children.push(fileNode);
+    }
+  }
+
+  return root.children || [];
+};
+
+const buildTree = (nodes: FileNode[]): FileNode[] => {
+  const root: FileNode = { id: '', name: '', type: 'folder', path: '', children: [] };
+  const map = new Map<string, FileNode>();
+  map.set('', root);
+
+  for (const node of nodes) {
+    const parts = node.path.split('/').filter(Boolean);
+    let current = root;
+    
+    for (let i = 0; i < parts.length - 1; i++) {
+      const folderPath = parts.slice(0, i + 1).join('/');
+      if (!map.has(folderPath)) {
+        const folder: FileNode = {
+          id: folderPath,
+          name: parts[i],
+          type: 'folder',
+          path: folderPath,
+          children: []
+        };
+        map.set(folderPath, folder);
+        current.children!.push(folder);
+      }
+      current = map.get(folderPath)!;
+    }
+    current.children!.push(node);
+  }
+
+  return root.children || [];
+};
   
   useEffect(() => {
-    const loadedTemplates = loadTemplates();
-    setTemplates(loadedTemplates);
-    
-    const state = location.state as any;
-    let templateId: string | null = null;
-    
-    if (state?.templateId) {
-      templateId = state.templateId;
-    } else {
-      templateId = loadSelectedTemplateId();
-    }
-    
-    if (templateId) {
-      setSelectedTemplateId(templateId);
-      saveSelectedTemplateId(templateId);
+    const loadWorkspace = async () => {
+      const loadedTemplates = loadTemplates();
+      setTemplates(loadedTemplates);
       
-      const savedFiles = loadWorkspaceFiles(templateId);
-      if (savedFiles && savedFiles.items.length > 0) {
-        setTemplateStorage(prev => ({
-          ...prev,
-          [templateId!]: {
-            files: [],
-            items: savedFiles.items,
-            results: savedFiles.results,
-            currentIndex: savedFiles.currentIndex
-          }
-        }));
+      const state = location.state as any;
+      let templateId: string | null = null;
+      
+      if (state?.templateId) {
+        templateId = state.templateId;
       } else {
-        setTemplateStorage(prev => ({
-          ...prev,
-          [templateId!]: prev[templateId!] || {
-            files: [],
-            items: [],
-            results: [],
-            currentIndex: 0
-          }
-        }));
+        templateId = loadSelectedTemplateId();
       }
       
-      const template = loadedTemplates.find((t: AnnotationTemplate) => t.id === templateId);
-      if (template?.llmConfigs && template.llmConfigs.length > 0) {
-        setLlmConfig(template.llmConfigs[0]);
+      const templateExists = loadedTemplates.some((t: AnnotationTemplate) => t.id === templateId);
+      if (templateId && templateExists) {
+        setSelectedTemplateId(templateId);
+        saveSelectedTemplateId(templateId);
+        
+        const savedFiles = loadWorkspaceFiles(templateId);
+        if (savedFiles && savedFiles.items.length > 0) {
+          const restoredFiles = buildTreeFromNodes(savedFiles.fileNodes || []);
+          
+          const itemsWithImages = await Promise.all(
+            savedFiles.items.map(async (item) => {
+              const imageData = await getImage(item.id);
+              return { ...item, imageData: imageData || undefined };
+            })
+          );
+          
+          setTemplateStorage(prev => ({
+            ...prev,
+            [templateId!]: {
+              files: restoredFiles,
+              items: itemsWithImages,
+              results: savedFiles.results,
+              currentIndex: savedFiles.currentIndex
+            }
+          }));
+        } else {
+          setTemplateStorage(prev => ({
+            ...prev,
+            [templateId!]: prev[templateId!] || {
+              files: [],
+              items: [],
+              results: [],
+              currentIndex: 0
+            }
+          }));
+        }
+        
+        const template = loadedTemplates.find((t: AnnotationTemplate) => t.id === templateId);
+        if (template?.llmConfigs && template.llmConfigs.length > 0) {
+          setLlmConfig(template.llmConfigs[0]);
+        }
       }
-    }
+    };
+    loadWorkspace();
   }, [location.state]);
 
   useEffect(() => {
@@ -257,6 +417,7 @@ const Workspace: React.FC = () => {
         setGlobalSegmentPromptOverride(savedState.segmentPromptOverride || '');
         setGlobalCOTPromptOverride(savedState.cotPromptOverride || '');
         setSegmentAnnotations(savedState.segmentAnnotations || []);
+        setDrawAnnotations(savedState.drawAnnotations || []);
         setSegmentError(savedState.segmentError || '');
         setCotError(savedState.cotError || '');
       } else {
@@ -264,6 +425,7 @@ const Workspace: React.FC = () => {
         setGlobalSegmentPromptOverride('');
         setGlobalCOTPromptOverride('');
         setSegmentAnnotations([]);
+        setDrawAnnotations([]);
         setSegmentError('');
         setCotError('');
       }
@@ -277,11 +439,12 @@ const Workspace: React.FC = () => {
         segmentPromptOverride: globalSegmentPromptOverride,
         cotPromptOverride: globalCOTPromptOverride,
         segmentAnnotations,
+        drawAnnotations,
         segmentError,
         cotError,
       });
     }
-  }, [formData, globalSegmentPromptOverride, globalCOTPromptOverride, segmentAnnotations, segmentError, cotError, selectedTemplateId, currentItem?.id]);
+  }, [formData, globalSegmentPromptOverride, globalCOTPromptOverride, segmentAnnotations, drawAnnotations, segmentError, cotError, selectedTemplateId, currentItem?.id]);
 
   useEffect(() => {
     if (selectedTemplateId && currentStorage && currentStorage.items.length > 0) {
@@ -289,9 +452,24 @@ const Workspace: React.FC = () => {
         items: currentStorage.items,
         results: currentStorage.results,
         currentIndex: currentStorage.currentIndex,
+        fileNodes: currentStorage.files,
       });
     }
   }, [currentStorage, selectedTemplateId]);
+
+  useEffect(() => {
+    const handleClickOutside = (e: MouseEvent) => {
+      if (pointSizeRef.current && !pointSizeRef.current.contains(e.target as Node)) {
+        setShowPointSizeSettings(false);
+      }
+    };
+    if (showPointSizeSettings) {
+      document.addEventListener('mousedown', handleClickOutside);
+    }
+    return () => {
+      document.removeEventListener('mousedown', handleClickOutside);
+    };
+  }, [showPointSizeSettings]);
 
   const saveFormDataRef = useRef(formData);
   const currentItemRef = useRef(currentItem);
@@ -560,12 +738,31 @@ const Workspace: React.FC = () => {
     const files = e.target.files;
     if (!files || !selectedTemplate) return;
 
+    const currentStorage = templateStorage[selectedTemplateId];
+    const existingPaths = new Set(currentStorage?.items?.map(item => item.fileName) || []);
+
     const validFiles: File[] = [];
+    const duplicates: string[] = [];
+    
     for (let i = 0; i < files.length; i++) {
       const file = files[i];
       const isImage = selectedTemplate.dataType === 'image' && file.type.startsWith('image/');
       const isText = selectedTemplate.dataType === 'text' && (file.type === 'text/plain' || file.name.endsWith('.txt'));
-      if (isImage || isText) validFiles.push(file);
+      if (!isImage && !isText) continue;
+      
+      if (existingPaths.has(file.name)) {
+        duplicates.push(file.name);
+      } else {
+        validFiles.push(file);
+      }
+    }
+
+    if (duplicates.length > 0) {
+      setDuplicateFiles(duplicates);
+      setPendingFiles(validFiles);
+      setShowDuplicateDialog(true);
+      if (fileInputRef.current) fileInputRef.current.value = '';
+      return;
     }
 
     if (validFiles.length === 0) {
@@ -573,14 +770,22 @@ const Workspace: React.FC = () => {
       return;
     }
 
-    setUploadProgress({ current: 0, total: validFiles.length, visible: true });
+    await processFilesUpload(validFiles);
+  };
+
+  const processFilesUpload = async (files: File[]) => {
+    if (files.length === 0 || !selectedTemplate) return;
+
+    setUploadProgress({ current: 0, total: files.length, visible: true });
 
     const items: DatasetItem[] = [];
     const results: AnnotationResult[] = [];
     const fileNodes: FileNode[] = [];
+    const currentStorage = templateStorage[selectedTemplateId];
+    const existingNodes = flattenFileNodes(currentStorage?.files || []);
 
-    for (let i = 0; i < validFiles.length; i++) {
-      const file = validFiles[i];
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
       const fileWithPath = file as File & { webkitRelativePath?: string };
       const relativePath = fileWithPath.webkitRelativePath || file.name;
       const itemId = `item-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
@@ -634,47 +839,19 @@ const Workspace: React.FC = () => {
       }
     }
 
-    const buildTree = (nodes: FileNode[]): FileNode[] => {
-      const root: FileNode = { id: '', name: '', type: 'folder', path: '', children: [] };
-      const map = new Map<string, FileNode>();
-      map.set('', root);
-
-      for (const node of nodes) {
-        const parts = node.path.split('/').filter(Boolean);
-        let current = root;
-        
-        for (let i = 0; i < parts.length - 1; i++) {
-          const folderPath = parts.slice(0, i + 1).join('/');
-          if (!map.has(folderPath)) {
-            const folder: FileNode = {
-              id: folderPath,
-              name: parts[i],
-              type: 'folder',
-              path: folderPath,
-              children: []
-            };
-            map.set(folderPath, folder);
-            current.children!.push(folder);
-          }
-          current = map.get(folderPath)!;
-        }
-        current.children!.push(node);
-      }
-
-      return root.children || [];
-    };
-
+    const allNodes = [...existingNodes, ...fileNodes];
+    
     setTemplateStorage(prev => ({
       ...prev,
       [selectedTemplateId]: {
         ...prev[selectedTemplateId],
-        files: buildTree(fileNodes),
+        files: buildTree(allNodes),
         items: [...prev[selectedTemplateId].items, ...items],
         results: [...prev[selectedTemplateId].results, ...results]
       }
     }));
     
-    setUploadProgress(prev => ({ ...prev, current: validFiles.length }));
+    setUploadProgress(prev => ({ ...prev, current: files.length }));
     setTimeout(() => setUploadProgress(prev => ({ ...prev, visible: false })), 500);
     if (fileInputRef.current) fileInputRef.current.value = '';
   };
@@ -703,6 +880,93 @@ const Workspace: React.FC = () => {
       else next.add(folderId);
       return next;
     });
+  };
+
+  const handleDeleteFolder = (folderPath: string, folderName: string) => {
+    setDeleteConfirmFolder(folderPath);
+    setDeleteFolderName(folderName);
+  };
+
+  const confirmDeleteFolder = () => {
+    if (!deleteConfirmFolder || !selectedTemplateId) return;
+
+    const folderPath = deleteConfirmFolder;
+    const folderName = folderPath.split('/').pop()!;
+
+    try {
+      const allStates = JSON.parse(localStorage.getItem(WORKSPACE_STATE_KEY) || '{}');
+      const itemsToDelete = templateStorage[selectedTemplateId]?.items.filter(i => 
+        i.fileName.startsWith(folderPath + '/') || i.fileName.startsWith(folderName + '/')
+      ) || [];
+      const itemIdsToDelete = new Set(itemsToDelete.map(i => i.id));
+      
+      Object.keys(allStates).forEach(key => {
+        if (key.startsWith(selectedTemplateId + '_')) {
+          const itemId = key.replace(selectedTemplateId + '_', '');
+          if (itemIdsToDelete.has(itemId)) {
+            delete allStates[key];
+          }
+        }
+      });
+      localStorage.setItem(WORKSPACE_STATE_KEY, JSON.stringify(allStates));
+    } catch (error) {
+      console.error('Failed to clean up workspace states:', error);
+    }
+
+    const storage = templateStorage[selectedTemplateId];
+    const itemsToDelete = storage.items.filter(i => 
+      i.fileName.startsWith(folderPath + '/') || i.fileName.startsWith(folderName + '/')
+    );
+    itemsToDelete.forEach(item => {
+      if (item.id) {
+        deleteImagesByPrefix(item.id).catch(err => console.error('Failed to delete image:', err));
+      }
+    });
+
+    setTemplateStorage(prev => {
+      const storage = prev[selectedTemplateId];
+      const newItems = storage.items.filter(i => !i.fileName.startsWith(folderPath + '/') && !i.fileName.startsWith(folderName + '/'));
+      const newResults = storage.results.filter(r => {
+        const item = storage.items.find(i => i.id === r.itemId);
+        return item && !item.fileName.startsWith(folderPath + '/') && !item.fileName.startsWith(folderName + '/');
+      });
+      const existingNodes = flattenFileNodes(storage.files);
+      const newNodes = existingNodes.filter(n => !n.path.startsWith(folderPath + '/') && n.path !== folderPath);
+      
+      let newIndex = storage.currentIndex;
+      if (newIndex >= newItems.length) {
+        newIndex = Math.max(0, newItems.length - 1);
+      }
+
+      return {
+        ...prev,
+        [selectedTemplateId]: {
+          ...storage,
+          items: newItems,
+          results: newResults,
+          files: buildTree(newNodes),
+          currentIndex: newIndex
+        }
+      };
+    });
+
+    setDeleteConfirmFolder(null);
+    setDeleteFolderName('');
+  };
+
+  const handleDuplicateDialogConfirm = async () => {
+    setShowDuplicateDialog(false);
+    setDuplicateFiles([]);
+    if (pendingFiles.length > 0) {
+      await processFilesUpload(pendingFiles);
+    }
+    setPendingFiles([]);
+  };
+
+  const handleDuplicateDialogCancel = () => {
+    setShowDuplicateDialog(false);
+    setDuplicateFiles([]);
+    setPendingFiles([]);
   };
 
   const navigateItem = (direction: 'prev' | 'next') => {
@@ -751,6 +1015,167 @@ const Workspace: React.FC = () => {
     }));
     
     navigateItem('next');
+  };
+
+  const getCanvasCoordinates = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    const canvas = drawCanvasRef.current;
+    if (!canvas) return null;
+    const rect = canvas.getBoundingClientRect();
+    const scaleX = canvas.width / rect.width;
+    const scaleY = canvas.height / rect.height;
+    return {
+      x: (e.clientX - rect.left) * scaleX,
+      y: (e.clientY - rect.top) * scaleY
+    };
+  };
+
+  const handleCanvasMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (drawTool === 'none') return;
+    const coords = getCanvasCoordinates(e);
+    if (!coords) return;
+    
+    setIsDrawing(true);
+    setDrawStart(coords);
+    
+    if (drawTool === 'point') {
+      const newAnnotation = {
+        id: `ann-${Date.now()}`,
+        type: 'point' as const,
+        points: [coords.x, coords.y],
+        order: drawAnnotations.length + 1,
+        pointSize: pointSize
+      };
+      setDrawAnnotations(prev => [...prev, newAnnotation]);
+      setIsDrawing(false);
+    }
+  };
+
+  const handleCanvasMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (!isDrawing || drawTool === 'none' || drawTool === 'point') return;
+    const coords = getCanvasCoordinates(e);
+    if (!coords || !drawStart) return;
+    
+    redrawCanvas();
+    const ctx = drawCanvasRef.current?.getContext('2d');
+    if (!ctx) return;
+    
+    ctx.strokeStyle = '#165DFF';
+    ctx.lineWidth = 2;
+    
+    if (drawTool === 'rect') {
+      ctx.strokeRect(drawStart.x, drawStart.y, coords.x - drawStart.x, coords.y - drawStart.y);
+    } else if (drawTool === 'line') {
+      ctx.beginPath();
+      ctx.moveTo(drawStart.x, drawStart.y);
+      ctx.lineTo(coords.x, coords.y);
+      ctx.stroke();
+    }
+  };
+
+  const handleCanvasMouseUp = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (!isDrawing || drawTool === 'none') return;
+    const coords = getCanvasCoordinates(e);
+    if (!coords) {
+      setIsDrawing(false);
+      return;
+    }
+    
+    if (drawTool === 'rect' && drawStart) {
+      const newAnnotation = {
+        id: `ann-${Date.now()}`,
+        type: 'rect' as const,
+        points: [drawStart.x, drawStart.y, coords.x, coords.y],
+        order: drawAnnotations.length + 1
+      };
+      setDrawAnnotations(prev => [...prev, newAnnotation]);
+    } else if (drawTool === 'line' && drawStart) {
+      const newAnnotation = {
+        id: `ann-${Date.now()}`,
+        type: 'line' as const,
+        points: [drawStart.x, drawStart.y, coords.x, coords.y],
+        order: drawAnnotations.length + 1
+      };
+      setDrawAnnotations(prev => [...prev, newAnnotation]);
+    }
+    
+    setIsDrawing(false);
+    setDrawStart(null);
+  };
+
+  const redrawCanvas = useCallback(() => {
+    const canvas = drawCanvasRef.current;
+    const ctx = canvas?.getContext('2d');
+    if (!canvas || !ctx || !currentItem?.imageData) return;
+    
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    
+    for (const ann of drawAnnotations) {
+      ctx.strokeStyle = '#165DFF';
+      ctx.fillStyle = '#165DFF';
+      ctx.lineWidth = 2;
+      ctx.font = 'bold 14px sans-serif';
+      
+      if (ann.type === 'point') {
+        const size = ann.pointSize || 6;
+        ctx.beginPath();
+        ctx.arc(ann.points[0], ann.points[1], size, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillText(`${ann.order}`, ann.points[0] + size + 4, ann.points[1] - size - 2);
+      } else if (ann.type === 'rect') {
+        const [x1, y1, x2, y2] = ann.points;
+        const x = Math.min(x1, x2);
+        const y = Math.min(y1, y2);
+        const w = Math.abs(x2 - x1);
+        const h = Math.abs(y2 - y1);
+        ctx.strokeRect(x, y, w, h);
+        ctx.fillText(`${ann.order}`, x + 4, y - 6);
+      } else if (ann.type === 'line') {
+        ctx.beginPath();
+        ctx.moveTo(ann.points[0], ann.points[1]);
+        ctx.lineTo(ann.points[2], ann.points[3]);
+        ctx.stroke();
+        ctx.fillText(`${ann.order}`, ann.points[0] + 6, ann.points[1] - 6);
+      }
+    }
+  }, [drawAnnotations, currentItem?.imageData]);
+
+  useEffect(() => {
+    if (drawAnnotations.length > 0 && currentItem?.imageData && imageDimensions.width > 0) {
+      redrawCanvas();
+    }
+  }, [drawAnnotations, currentItem?.imageData, imageDimensions, redrawCanvas]);
+
+  useEffect(() => {
+    if (currentItem?.imageData && drawCanvasRef.current) {
+      const img = new Image();
+      img.onload = () => {
+        const canvas = drawCanvasRef.current;
+        if (canvas) {
+          canvas.width = img.width;
+          canvas.height = img.height;
+          setImageDimensions({ width: img.width, height: img.height });
+          if (drawAnnotations.length > 0) {
+            redrawCanvas();
+          }
+        }
+      };
+      img.src = currentItem.imageData;
+    }
+  }, [currentItem?.imageData, drawAnnotations, redrawCanvas]);
+
+  const deleteAnnotation = (id: string) => {
+    setDrawAnnotations(prev => {
+      const filtered = prev.filter(a => a.id !== id);
+      return filtered.map((a, idx) => ({ ...a, order: idx + 1 }));
+    });
+  };
+
+  const clearAllAnnotations = () => {
+    setDrawAnnotations([]);
+    const ctx = drawCanvasRef.current?.getContext('2d');
+    if (ctx) {
+      ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height);
+    }
   };
 
   const drawAnnotationsOnCanvas = useCallback((imageData: string, annotations: typeof segmentAnnotations) => {
@@ -937,7 +1362,8 @@ const Workspace: React.FC = () => {
   };
 
   const handleExportAnnotations = () => {
-    if (!currentStorage?.results.length) {
+    const annotatedItems = currentStorage?.items.filter(item => item.status === 'annotated') || [];
+    if (annotatedItems.length === 0) {
       alert('没有已标注的数据可导出');
       return;
     }
@@ -946,12 +1372,50 @@ const Workspace: React.FC = () => {
       templateId: selectedTemplateId,
       templateName: selectedTemplate?.name,
       exportedAt: new Date().toISOString(),
-      items: currentStorage.items.map(item => ({
+      items: annotatedItems.map(item => ({
         id: item.id,
         fileName: item.fileName,
         status: item.status,
       })),
-      results: currentStorage.results,
+      results: annotatedItems.map(item => {
+        const result = currentStorage?.results.find(r => r.itemId === item.id);
+        const stateKey = `${selectedTemplateId}_${item.id}`;
+        
+        let itemState: WorkspacePersistState | null = null;
+        try {
+          const allStates = JSON.parse(localStorage.getItem(WORKSPACE_STATE_KEY) || '{}');
+          itemState = allStates[stateKey] || null;
+        } catch (e) {
+          console.error('Failed to load item state:', e);
+        }
+        
+        const formData = itemState?.formData || {};
+        const labeledData: Record<string, string | string[]> = {};
+        
+        selectedTemplate?.fields.forEach(field => {
+          const value = formData[field.id];
+          if (value !== undefined && value !== null) {
+            labeledData[field.label] = value;
+          } else {
+            labeledData[field.label] = field.type === 'checkbox' ? [] : '';
+          }
+        });
+        
+        return {
+          itemId: item.id,
+          templateId: selectedTemplateId,
+          data: {
+            segmentation: itemState?.drawAnnotations?.map((ann: DrawAnnotation) => ({
+              pointId: ann.order,
+              type: ann.type,
+              coordinates: ann.points,
+              pointSize: ann.pointSize,
+            })) || [],
+            ...labeledData,
+          },
+          updatedAt: result?.updatedAt || new Date().toISOString(),
+        };
+      }),
     };
 
     const blob = new Blob([JSON.stringify(exportData, null, 2)], { type: 'application/json' });
@@ -988,7 +1452,64 @@ const Workspace: React.FC = () => {
           const existingResults = prev[selectedTemplateId]?.results || [];
           const existingIds = new Set(existingResults.map(r => r.itemId));
           
-          const newResults = data.results.filter((r: AnnotationResult) => !existingIds.has(r.itemId));
+          const newResults: AnnotationResult[] = [];
+          const itemIdMapping: Record<string, string> = {};
+          
+          data.items.forEach((importItem: { id: string; fileName: string }) => {
+            const existingItem = prev[selectedTemplateId]?.items.find(i => i.fileName === importItem.fileName);
+            if (existingItem) {
+              itemIdMapping[importItem.id] = existingItem.id;
+            }
+          });
+          
+          data.results.forEach((r: { itemId: string; templateId: string; data: Record<string, unknown>; updatedAt: string }) => {
+            const mappedItemId = itemIdMapping[r.itemId];
+            if (!mappedItemId || existingIds.has(mappedItemId)) return;
+            
+            const { segmentation, ...restData } = r.data;
+            
+            const formData: Record<string, string | string[]> = {};
+            selectedTemplate?.fields.forEach(field => {
+              if (restData[field.label] !== undefined) {
+                formData[field.id] = restData[field.label] as string | string[];
+              }
+            });
+            
+            newResults.push({
+              itemId: mappedItemId,
+              templateId: selectedTemplateId,
+              data: formData,
+              updatedAt: r.updatedAt,
+            });
+            
+            const stateKey = `${selectedTemplateId}_${mappedItemId}`;
+            
+            const drawAnnotations: DrawAnnotation[] = segmentation && Array.isArray(segmentation)
+              ? segmentation.map((seg: { pointId: number; type: string; coordinates: number[]; pointSize?: number }) => ({
+                  id: `ann-${Date.now()}-${seg.pointId}`,
+                  type: seg.type as 'point' | 'rect' | 'line',
+                  points: seg.coordinates,
+                  order: seg.pointId,
+                  pointSize: seg.pointSize,
+                }))
+              : [];
+            
+            try {
+              const allStates = JSON.parse(localStorage.getItem(WORKSPACE_STATE_KEY) || '{}');
+              allStates[stateKey] = {
+                ...allStates[stateKey],
+                formData,
+                drawAnnotations,
+                lastItemId: mappedItemId,
+                savedAt: new Date().toISOString(),
+              };
+              localStorage.setItem(WORKSPACE_STATE_KEY, JSON.stringify(allStates));
+            } catch (e) {
+              console.error('Failed to save item state:', e);
+            }
+          });
+          
+          const mappedItemIds = new Set(Object.values(itemIdMapping));
           
           return {
             ...prev,
@@ -996,12 +1517,25 @@ const Workspace: React.FC = () => {
               ...prev[selectedTemplateId],
               results: [...existingResults, ...newResults],
               items: prev[selectedTemplateId].items.map(item => {
-                const hasResult = data.results.some((r: AnnotationResult) => r.itemId === item.id);
-                return hasResult ? { ...item, status: 'annotated' as const } : item;
+                return mappedItemIds.has(item.id) ? { ...item, status: 'annotated' as const } : item;
               }),
             }
           };
         });
+
+        if (currentItem) {
+          const stateKey = `${selectedTemplateId}_${currentItem.id}`;
+          try {
+            const allStates = JSON.parse(localStorage.getItem(WORKSPACE_STATE_KEY) || '{}');
+            const currentState = allStates[stateKey];
+            if (currentState) {
+              setFormData(currentState.formData || {});
+              setDrawAnnotations(currentState.drawAnnotations || []);
+            }
+          } catch (e) {
+            console.error('Failed to reload current item state:', e);
+          }
+        }
 
         alert(`成功导入 ${data.results.length} 条标注数据`);
       } catch (error) {
@@ -1015,16 +1549,20 @@ const Workspace: React.FC = () => {
 
   const renderFileTree = (nodes: FileNode[], depth: number = 0) => {
     return nodes.map(node => {
-      const matchingItemIndex = node.type === 'file' 
-        ? currentStorage.items.findIndex(item => item.fileName === node.name || item.id === node.id)
+      const matchingItem = node.type === 'file' 
+        ? currentStorage.items.find(item => item.fileName === node.name || item.id === node.id)
+        : null;
+      const matchingItemIndex = matchingItem 
+        ? currentStorage.items.findIndex(item => item.id === matchingItem.id)
         : -1;
+      const isAnnotated = matchingItem?.status === 'annotated';
       
       return (
         <div key={node.id}>
           <div 
-            className={`flex items-center gap-2 py-1.5 px-2 rounded hover:bg-secondary/50 cursor-pointer ${
+            className={`flex items-center gap-2 py-1.5 px-2 rounded hover:bg-secondary/50 cursor-pointer group ${
               matchingItemIndex !== -1 && matchingItemIndex === currentIndex ? 'bg-primary/10' : ''
-            }`}
+            } ${isAnnotated ? 'bg-emerald-50/70 border-l-2 border-emerald-400' : matchingItem ? 'bg-amber-50/60 border-l-2 border-amber-300' : ''}`}
             style={{ paddingLeft: `${depth * 16 + 8}px` }}
             onClick={() => {
               if (node.type === 'folder') {
@@ -1053,13 +1591,27 @@ const Workspace: React.FC = () => {
               <>
                 <span className="w-[14px]" />
                 {selectedTemplate?.dataType === 'image' ? (
-                  <ImageIcon size={16} className="text-green-500" />
+                  <ImageIcon size={16} className={isAnnotated ? 'text-emerald-500' : matchingItem ? 'text-amber-400' : 'text-muted-foreground'} />
                 ) : (
-                  <FileIcon size={16} className="text-muted-foreground" />
+                  <FileIcon size={16} className={isAnnotated ? 'text-emerald-500' : matchingItem ? 'text-amber-400' : 'text-muted-foreground'} />
                 )}
               </>
             )}
-            <span className="text-sm truncate">{node.name}</span>
+            <span className={`text-sm truncate flex-1 ${isAnnotated ? 'text-emerald-600 font-medium' : matchingItem ? 'text-amber-600' : ''}`}>
+              {node.name}
+            </span>
+            {node.type === 'folder' && (
+              <button
+                className="opacity-0 group-hover:opacity-100 p-1 hover:bg-red-100 rounded transition-opacity"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  handleDeleteFolder(node.path, node.name);
+                }}
+                title="删除文件夹"
+              >
+                <XIcon size={14} className="text-red-500" />
+              </button>
+            )}
           </div>
           {node.type === 'folder' && expandedFolders.has(node.id) && node.children && (
             renderFileTree(node.children, depth + 1)
@@ -1244,7 +1796,7 @@ const Workspace: React.FC = () => {
         
         <div className="w-[280px] border-r border-border bg-card flex flex-col shrink-0">
           <div className="p-4 border-b border-border">
-            <div className="flex items-center justify-between mb-3">
+            <div className="flex items-center justify-between">
               <h3 className="font-semibold text-sm">数据文件</h3>
               <Button 
                 variant="outline" 
@@ -1265,65 +1817,13 @@ const Workspace: React.FC = () => {
                 accept={selectedTemplate.dataType === 'image' ? 'image/*' : '.txt'}
               />
             </div>
-            
-            <div className="flex gap-1">
-              <Button 
-                variant={viewMode === 'grid' ? 'secondary' : 'ghost'} 
-                size="sm" 
-                className="h-7 w-7 p-0"
-                onClick={() => setViewMode('grid')}
-              >
-                <LayoutGridIcon size={14} />
-              </Button>
-              <Button 
-                variant={viewMode === 'list' ? 'secondary' : 'ghost'} 
-                size="sm" 
-                className="h-7 w-7 p-0"
-                onClick={() => setViewMode('list')}
-              >
-                <ListIcon size={14} />
-              </Button>
-            </div>
           </div>
 
           <ScrollArea className="flex-1">
             {currentStorage.files.length > 0 ? (
-              viewMode === 'list' ? (
-                <div className="p-2">
-                  {renderFileTree(currentStorage.files)}
-                </div>
-              ) : (
-                <div className="p-3 grid grid-cols-3 gap-2">
-                  {currentStorage.items.map((item, idx) => (
-                    <div
-                      key={item.id}
-                      className={`aspect-square rounded border overflow-hidden cursor-pointer transition-all ${
-                        idx === currentIndex ? 'ring-2 ring-primary' : 'border-border hover:border-primary/50'
-                      } ${item.status === 'annotated' ? 'opacity-60' : ''}`}
-                      onClick={() => setTemplateStorage(prev => ({
-                        ...prev,
-                        [selectedTemplateId]: {
-                          ...prev[selectedTemplateId],
-                          currentIndex: idx
-                        }
-                      }))}
-                    >
-                      {selectedTemplate.dataType === 'image' && item.imageData ? (
-                        <img src={item.imageData} alt={item.fileName} className="w-full h-full object-cover" />
-                      ) : (
-                        <div className="w-full h-full flex items-center justify-center bg-secondary">
-                          <FileIcon size={24} className="text-muted-foreground" />
-                        </div>
-                      )}
-                      {item.status === 'annotated' && (
-                        <div className="absolute top-1 right-1 w-4 h-4 bg-green-500 rounded-full flex items-center justify-center">
-                          <CheckCircle2Icon size={10} className="text-white" />
-                        </div>
-                      )}
-                    </div>
-                  ))}
-                </div>
-              )
+              <div className="p-2">
+                {renderFileTree(currentStorage.files)}
+              </div>
             ) : (
               <div 
                 className="m-4 border-2 border-dashed border-border rounded-lg p-8 text-center"
@@ -1357,24 +1857,94 @@ const Workspace: React.FC = () => {
                     {currentItem.fileName}
                   </h2>
                   {selectedTemplate.dataType === 'image' && currentItem.imageData && (
-                    <div className="flex gap-2">
-                      <Button 
+                    <div className="flex gap-2 items-center">
+                      <div className="flex gap-1 border-r border-gray-300 pr-2 mr-2">
+                        <Button 
+                          variant={drawTool === 'none' ? 'secondary' : 'ghost'} 
+                          size="sm" 
+                          className="h-8 w-8 p-0"
+                          onClick={() => setDrawTool('none')}
+                          title="选择工具"
+                        >
+                          <CheckSquareIcon size={14} />
+                        </Button>
+                        <div className="relative" ref={pointSizeRef}>
+                          <Button 
+                            variant={drawTool === 'point' ? 'secondary' : 'ghost'} 
+                            size="sm" 
+                            className="h-8 w-8 p-0"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setDrawTool('point');
+                              setShowPointSizeSettings(!showPointSizeSettings);
+                            }}
+                            title="点标注"
+                          >
+                            <CircleIcon size={14} />
+                          </Button>
+                          {showPointSizeSettings && (
+                            <div className="absolute left-0 top-full mt-1 bg-white border border-gray-200 rounded-lg shadow-lg p-3 z-50">
+                              <div className="flex items-center gap-2 whitespace-nowrap">
+                                <span className="text-xs text-gray-500">点大小:</span>
+                                <input
+                                  type="range"
+                                  min="2"
+                                  max="20"
+                                  value={pointSize}
+                                  onChange={e => setPointSize(Number(e.target.value))}
+                                  className="w-24 h-2"
+                                />
+                                <span className="text-xs w-6 text-center">{pointSize}</span>
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                        <Button 
+                          variant={drawTool === 'rect' ? 'secondary' : 'ghost'} 
+                          size="sm" 
+                          className="h-8 w-8 p-0"
+                          onClick={() => setDrawTool('rect')}
+                          title="矩形框标注"
+                        >
+                          <SquareIcon size={14} />
+                        </Button>
+                        <Button 
+                          variant={drawTool === 'line' ? 'secondary' : 'ghost'} 
+                          size="sm" 
+                          className="h-8 w-8 p-0"
+                          onClick={() => setDrawTool('line')}
+                          title="线条标注"
+                        >
+                          <MinusIcon size={14} />
+                        </Button>
+                       </div>
+                      <Button
                         variant="outline" 
                         size="sm" 
-                        className="h-8 w-8 p-0"
-                        onClick={() => setImageZoom(z => Math.max(0.25, z - 0.25))}
+                        className="h-8 text-xs text-red-600 hover:bg-red-50"
+                        onClick={clearAllAnnotations}
                       >
-                        <ZoomOutIcon size={14} />
+                        清除
                       </Button>
-                      <span className="text-sm flex items-center w-12 justify-center">{Math.round(imageZoom * 100)}%</span>
-                      <Button 
-                        variant="outline" 
-                        size="sm" 
-                        className="h-8 w-8 p-0"
-                        onClick={() => setImageZoom(z => Math.min(3, z + 0.25))}
-                      >
-                        <ZoomInIcon size={14} />
-                      </Button>
+                      <div className="flex gap-1 border-l border-gray-300 pl-2 ml-2">
+                        <Button 
+                          variant="outline" 
+                          size="sm" 
+                          className="h-8 w-8 p-0"
+                          onClick={() => setImageZoom(z => Math.max(0.25, z - 0.25))}
+                        >
+                          <ZoomOutIcon size={14} />
+                        </Button>
+                        <span className="text-sm flex items-center w-12 justify-center">{Math.round(imageZoom * 100)}%</span>
+                        <Button 
+                          variant="outline" 
+                          size="sm" 
+                          className="h-8 w-8 p-0"
+                          onClick={() => setImageZoom(z => Math.min(3, z + 0.25))}
+                        >
+                          <ZoomInIcon size={14} />
+                        </Button>
+                      </div>
                     </div>
                   )}
                 </div>
@@ -1387,15 +1957,26 @@ const Workspace: React.FC = () => {
                           src={currentItem.imageData} 
                           alt={currentItem.fileName}
                           className="max-w-full h-auto rounded-lg shadow-lg"
+                          style={{ display: 'none' }}
+                        />
+                        <canvas
+                          ref={drawCanvasRef}
+                          className="max-w-full h-auto rounded-lg shadow-lg cursor-crosshair"
                           style={{ 
                             transform: `scale(${imageZoom})`,
-                            display: segmentAnnotations.length > 0 ? 'none' : 'block'
+                            transformOrigin: 'center',
+                            backgroundImage: `url(${currentItem.imageData})`,
+                            backgroundSize: '100% 100%'
                           }}
+                          onMouseDown={handleCanvasMouseDown}
+                          onMouseMove={handleCanvasMouseMove}
+                          onMouseUp={handleCanvasMouseUp}
+                          onMouseLeave={handleCanvasMouseUp}
                         />
                         {segmentAnnotations.length > 0 && (
                           <canvas
                             ref={imageCanvasRef}
-                            className="max-w-full h-auto rounded-lg shadow-lg"
+                            className="max-w-full h-auto rounded-lg shadow-lg absolute top-0 left-0"
                             style={{ transform: `scale(${imageZoom})` }}
                           />
                         )}
@@ -1669,6 +2250,53 @@ const Workspace: React.FC = () => {
             <DialogTitle>大模型配置</DialogTitle>
           </DialogHeader>
           <LLMSettings value={llmConfig} onChange={setLlmConfig} dataType={selectedTemplate?.dataType || 'text'} />
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={showDuplicateDialog} onOpenChange={setShowDuplicateDialog}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>发现重复文件</DialogTitle>
+            <DialogDescription>
+              以下文件已存在，将被跳过：
+            </DialogDescription>
+          </DialogHeader>
+          <div className="max-h-60 overflow-y-auto my-4">
+            <ul className="space-y-1">
+              {duplicateFiles.map((name, idx) => (
+                <li key={idx} className="text-sm text-muted-foreground flex items-center gap-2">
+                  <XIcon size={14} className="text-red-500 flex-shrink-0" />
+                  <span className="truncate">{name}</span>
+                </li>
+              ))}
+            </ul>
+          </div>
+          {pendingFiles.length > 0 && (
+            <p className="text-sm text-muted-foreground mb-4">
+              另有 {pendingFiles.length} 个新文件将被上传
+            </p>
+          )}
+          <DialogFooter>
+            <Button variant="outline" onClick={handleDuplicateDialogCancel}>取消</Button>
+            <Button onClick={handleDuplicateDialogConfirm}>
+              {pendingFiles.length > 0 ? '继续上传' : '确定'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={!!deleteConfirmFolder} onOpenChange={() => setDeleteConfirmFolder(null)}>
+        <DialogContent className="max-w-sm">
+          <DialogHeader>
+            <DialogTitle>确认删除文件夹</DialogTitle>
+            <DialogDescription>
+              确定要删除文件夹 "{deleteFolderName}" 及其所有内容吗？此操作不可撤销。
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setDeleteConfirmFolder(null)}>取消</Button>
+            <Button variant="destructive" onClick={confirmDeleteFolder}>删除</Button>
+          </DialogFooter>
         </DialogContent>
       </Dialog>
     </div>

@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState, useEffect } from 'react';
 import { Link } from 'react-router-dom';
 import { 
   UploadCloudIcon, 
@@ -11,9 +11,51 @@ import {
 } from 'lucide-react';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
+import type { AnnotationTemplate, DatasetItem } from '@/types/annotation';
+
+const STORAGE_KEY = 'labelcot_templates';
+const WORKSPACE_FILES_KEY = 'labelcot_workspace_files';
+
+const loadTemplates = (): AnnotationTemplate[] => {
+  try {
+    const stored = localStorage.getItem(STORAGE_KEY);
+    if (stored) {
+      return JSON.parse(stored);
+    }
+  } catch (error) {
+    console.error('Failed to load templates:', error);
+  }
+  return [];
+};
+
+const loadAnnotatedCount = (): number => {
+  try {
+    const stored = localStorage.getItem(WORKSPACE_FILES_KEY);
+    if (stored) {
+      const allFiles = JSON.parse(stored);
+      let count = 0;
+      for (const templateId in allFiles) {
+        const items: DatasetItem[] = allFiles[templateId].items || [];
+        count += items.filter(item => item.status === 'annotated').length;
+      }
+      return count;
+    }
+  } catch (error) {
+    console.error('Failed to load annotated count:', error);
+  }
+  return 0;
+};
 
 const Dashboard: React.FC = () => {
   console.log('Dashboard page rendered');
+
+  const [templates, setTemplates] = useState<AnnotationTemplate[]>([]);
+  const [annotatedCount, setAnnotatedCount] = useState(0);
+
+  useEffect(() => {
+    setTemplates(loadTemplates());
+    setAnnotatedCount(loadAnnotatedCount());
+  }, []);
 
   const handleImport = () => {
     console.log('Triggering import flow: JSON + Dataset + Template');
@@ -62,7 +104,7 @@ const Dashboard: React.FC = () => {
             <FileJsonIcon className="text-primary" size={18} />
           </CardHeader>
           <CardContent>
-            <div className="text-3xl font-bold text-foreground">12</div>
+            <div className="text-3xl font-bold text-foreground">{templates.length}</div>
             <p className="text-xs text-muted-foreground mt-1">支持大模型辅助</p>
           </CardContent>
         </Card>
@@ -72,8 +114,8 @@ const Dashboard: React.FC = () => {
             <ActivityIcon className="text-primary" size={18} />
           </CardHeader>
           <CardContent>
-            <div className="text-3xl font-bold text-foreground">845</div>
-            <p className="text-xs text-muted-foreground mt-1">准确率 98.2%</p>
+            <div className="text-3xl font-bold text-foreground">{annotatedCount}</div>
+            <p className="text-xs text-muted-foreground mt-1">已完成标注</p>
           </CardContent>
         </Card>
       </div>
