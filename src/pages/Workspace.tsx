@@ -5,7 +5,7 @@ import {
   FolderUpIcon, ImageIcon, FileIcon, FolderIcon, ChevronDownIcon, 
   ChevronRightIcon as TreeChevronIcon, PlusIcon, CheckSquareIcon, XIcon,
   LayoutGridIcon, ListIcon, ZoomInIcon, ZoomOutIcon, SparklesIcon, FileJsonIcon,
-  DownloadIcon, UploadIcon
+  DownloadIcon, UploadIcon, BotIcon
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
@@ -23,10 +23,102 @@ import { Input } from '@/components/ui/input';
 import { Progress } from '@/components/ui/progress';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import LLMSettings from '@/components/LLMSettings';
-import { segmentImage, generateStructuredOutput } from '@/services/llm';
+import { segmentImage, generateStructuredOutput, callLLM } from '@/services/llm';
 import type { FileNode, DatasetItem, AnnotationResult, AnnotationTemplate, TemplateStorage, LLMConfig } from '@/types/annotation';
 
 const STORAGE_KEY = 'labelcot_templates';
+const WORKSPACE_STATE_KEY = 'labelcot_workspace_state';
+const WORKSPACE_FILES_KEY = 'labelcot_workspace_files';
+const WORKSPACE_TEMPLATE_ID_KEY = 'labelcot_workspace_template_id';
+
+interface WorkspacePersistState {
+  formData: Record<string, string | string[]>;
+  segmentPromptOverride: string;
+  cotPromptOverride: string;
+  segmentAnnotations: Array<{ label: string; bbox?: [number, number, number, number]; confidence?: number }>;
+  segmentError: string;
+  cotError: string;
+  lastItemId: string | null;
+  savedAt: string;
+}
+
+interface WorkspaceFilesState {
+  templateId: string;
+  items: DatasetItem[];
+  results: AnnotationResult[];
+  currentIndex: number;
+  savedAt: string;
+}
+
+const saveWorkspaceState = (templateId: string, itemId: string, state: Partial<WorkspacePersistState>) => {
+  try {
+    const allStates = JSON.parse(localStorage.getItem(WORKSPACE_STATE_KEY) || '{}');
+    const key = `${templateId}_${itemId}`;
+    allStates[key] = {
+      ...allStates[key],
+      ...state,
+      lastItemId: itemId,
+      savedAt: new Date().toISOString(),
+    };
+    localStorage.setItem(WORKSPACE_STATE_KEY, JSON.stringify(allStates));
+  } catch (error) {
+    console.error('Failed to save workspace state:', error);
+  }
+};
+
+const loadWorkspaceState = (templateId: string, itemId: string): WorkspacePersistState | null => {
+  try {
+    const allStates = JSON.parse(localStorage.getItem(WORKSPACE_STATE_KEY) || '{}');
+    const key = `${templateId}_${itemId}`;
+    return allStates[key] || null;
+  } catch (error) {
+    console.error('Failed to load workspace state:', error);
+    return null;
+  }
+};
+
+const saveWorkspaceFiles = (templateId: string, data: { items: DatasetItem[]; results: AnnotationResult[]; currentIndex: number }) => {
+  try {
+    const allFiles = JSON.parse(localStorage.getItem(WORKSPACE_FILES_KEY) || '{}');
+    allFiles[templateId] = {
+      templateId,
+      items: data.items,
+      results: data.results,
+      currentIndex: data.currentIndex,
+      savedAt: new Date().toISOString(),
+    };
+    localStorage.setItem(WORKSPACE_FILES_KEY, JSON.stringify(allFiles));
+  } catch (error) {
+    console.error('Failed to save workspace files:', error);
+  }
+};
+
+const loadWorkspaceFiles = (templateId: string): WorkspaceFilesState | null => {
+  try {
+    const allFiles = JSON.parse(localStorage.getItem(WORKSPACE_FILES_KEY) || '{}');
+    return allFiles[templateId] || null;
+  } catch (error) {
+    console.error('Failed to load workspace files:', error);
+    return null;
+  }
+};
+
+const saveSelectedTemplateId = (templateId: string) => {
+  try {
+    localStorage.setItem(WORKSPACE_TEMPLATE_ID_KEY, templateId);
+  } catch (error) {
+    console.error('Failed to save selected template ID:', error);
+  }
+};
+
+const loadSelectedTemplateId = (): string | null => {
+  try {
+    return localStorage.getItem(WORKSPACE_TEMPLATE_ID_KEY);
+  } catch (error) {
+    console.error('Failed to load selected template ID:', error);
+    return null;
+  }
+};
 
 const loadTemplates = (): AnnotationTemplate[] => {
   try {
@@ -42,6 +134,8 @@ const loadTemplates = (): AnnotationTemplate[] => {
         useLLM: t.llm || false,
         llmConfigs: t.llmConfigs || [],
         llmPrompts: t.llmPrompts || [],
+        globalSegmentPrompt: t.globalSegmentPrompt || '',
+        globalCOTPrompt: t.globalCOTPrompt || '',
         createdAt: t.date || new Date().toISOString().slice(0, 10),
       }));
     }
@@ -78,30 +172,60 @@ const Workspace: React.FC = () => {
   });
   const [llmConfig, setLlmConfig] = useState<LLMConfig>(defaultLLMConfig);
   const [showLLMSettings, setShowLLMSettings] = useState(false);
-  const [llmLoading, setLlmLoading] = useState(false);
-  const [segmentResult, setSegmentResult] = useState<string>('');
-  const [outputResult, setOutputResult] = useState<string>('');
-  const [outputTemplate, setOutputTemplate] = useState<string>('将标注数据转换为JSON格式');
-  const [showOutputDialog, setShowOutputDialog] = useState(false);
+  
+  const [segmentLoading, setSegmentLoading] = useState(false);
+  const [segmentError, setSegmentError] = useState<string>('');
+  const [segmentAnnotations, setSegmentAnnotations] = useState<Array<{ label: string; bbox?: [number, number, number, number]; confidence?: number }>>([]);
+  const imageCanvasRef = useRef<HTMLCanvasElement>(null);
+  const [imageDimensions, setImageDimensions] = useState<{ width: number; height: number }>({ width: 0, height: 0 });
+  
+  const [cotLoading, setCotLoading] = useState(false);
+  const [cotError, setCotError] = useState<string>('');
+  
+  const [globalSegmentPromptOverride, setGlobalSegmentPromptOverride] = useState<string>('');
+  const [globalCOTPromptOverride, setGlobalCOTPromptOverride] = useState<string>('');
+  
   const annotationImportRef = useRef<HTMLInputElement>(null);
-
+  
   useEffect(() => {
     const loadedTemplates = loadTemplates();
     setTemplates(loadedTemplates);
     
     const state = location.state as any;
+    let templateId: string | null = null;
+    
     if (state?.templateId) {
-      const templateId = state.templateId;
+      templateId = state.templateId;
+    } else {
+      templateId = loadSelectedTemplateId();
+    }
+    
+    if (templateId) {
       setSelectedTemplateId(templateId);
-      setTemplateStorage(prev => ({
-        ...prev,
-        [templateId]: prev[templateId] || {
-          files: [],
-          items: [],
-          results: [],
-          currentIndex: 0
-        }
-      }));
+      saveSelectedTemplateId(templateId);
+      
+      const savedFiles = loadWorkspaceFiles(templateId);
+      if (savedFiles && savedFiles.items.length > 0) {
+        setTemplateStorage(prev => ({
+          ...prev,
+          [templateId!]: {
+            files: [],
+            items: savedFiles.items,
+            results: savedFiles.results,
+            currentIndex: savedFiles.currentIndex
+          }
+        }));
+      } else {
+        setTemplateStorage(prev => ({
+          ...prev,
+          [templateId!]: prev[templateId!] || {
+            files: [],
+            items: [],
+            results: [],
+            currentIndex: 0
+          }
+        }));
+      }
       
       const template = loadedTemplates.find((t: AnnotationTemplate) => t.id === templateId);
       if (template?.llmConfigs && template.llmConfigs.length > 0) {
@@ -124,6 +248,50 @@ const Workspace: React.FC = () => {
   const currentItem = currentStorage && currentStorage.items[currentStorage.currentIndex] || null;
   const totalItems = currentStorage?.items.length || 0;
   const currentIndex = currentStorage?.currentIndex || 0;
+
+  useEffect(() => {
+    if (selectedTemplateId && currentItem?.id) {
+      const savedState = loadWorkspaceState(selectedTemplateId, currentItem.id);
+      if (savedState) {
+        setFormData(savedState.formData || {});
+        setGlobalSegmentPromptOverride(savedState.segmentPromptOverride || '');
+        setGlobalCOTPromptOverride(savedState.cotPromptOverride || '');
+        setSegmentAnnotations(savedState.segmentAnnotations || []);
+        setSegmentError(savedState.segmentError || '');
+        setCotError(savedState.cotError || '');
+      } else {
+        setFormData({});
+        setGlobalSegmentPromptOverride('');
+        setGlobalCOTPromptOverride('');
+        setSegmentAnnotations([]);
+        setSegmentError('');
+        setCotError('');
+      }
+    }
+  }, [selectedTemplateId, currentItem?.id, templates]);
+
+  useEffect(() => {
+    if (selectedTemplateId && currentItem?.id) {
+      saveWorkspaceState(selectedTemplateId, currentItem.id, {
+        formData,
+        segmentPromptOverride: globalSegmentPromptOverride,
+        cotPromptOverride: globalCOTPromptOverride,
+        segmentAnnotations,
+        segmentError,
+        cotError,
+      });
+    }
+  }, [formData, globalSegmentPromptOverride, globalCOTPromptOverride, segmentAnnotations, segmentError, cotError, selectedTemplateId, currentItem?.id]);
+
+  useEffect(() => {
+    if (selectedTemplateId && currentStorage && currentStorage.items.length > 0) {
+      saveWorkspaceFiles(selectedTemplateId, {
+        items: currentStorage.items,
+        results: currentStorage.results,
+        currentIndex: currentStorage.currentIndex,
+      });
+    }
+  }, [currentStorage, selectedTemplateId]);
 
   const saveFormDataRef = useRef(formData);
   const currentItemRef = useRef(currentItem);
@@ -341,16 +509,20 @@ const Workspace: React.FC = () => {
     const isImage = file.type.startsWith('image/');
     
     if (isImage) {
-      const dataUrl = URL.createObjectURL(file);
-      setTemplateStorage(prev => ({
-        ...prev,
-        [selectedTemplateId]: {
-          ...prev[selectedTemplateId],
-          items: prev[selectedTemplateId].items.map(i =>
-            i.id === item.id ? { ...i, imageData: dataUrl, loaded: true } : i
-          )
-        }
-      }));
+      const reader = new FileReader();
+      reader.onload = () => {
+        const dataUrl = reader.result as string;
+        setTemplateStorage(prev => ({
+          ...prev,
+          [selectedTemplateId]: {
+            ...prev[selectedTemplateId],
+            items: prev[selectedTemplateId].items.map(i =>
+              i.id === item.id ? { ...i, imageData: dataUrl, loaded: true } : i
+            )
+          }
+        }));
+      };
+      reader.readAsDataURL(file);
     } else {
       const content = await file.text();
       setTemplateStorage(prev => ({
@@ -413,6 +585,23 @@ const Workspace: React.FC = () => {
       const relativePath = fileWithPath.webkitRelativePath || file.name;
       const itemId = `item-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
       
+      let imageData: string | undefined;
+      let textContent: string | undefined;
+      
+      if (selectedTemplate.dataType === 'image' && file.type.startsWith('image/')) {
+        imageData = await new Promise<string>((resolve) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result as string);
+          reader.readAsDataURL(file);
+        });
+      } else if (selectedTemplate.dataType === 'text') {
+        textContent = await new Promise<string>((resolve) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result as string);
+          reader.readAsText(file);
+        });
+      }
+      
       fileNodes.push({
         id: relativePath,
         name: file.name,
@@ -426,8 +615,10 @@ const Workspace: React.FC = () => {
         fileName: file.name,
         status: 'pending',
         templateId: selectedTemplateId,
-        loaded: false,
+        loaded: true,
         file,
+        imageData,
+        textContent,
       });
 
       results.push({
@@ -562,82 +753,186 @@ const Workspace: React.FC = () => {
     navigateItem('next');
   };
 
-  const handleAISegment = async () => {
-    if (!currentItem?.imageData) return;
+  const drawAnnotationsOnCanvas = useCallback((imageData: string, annotations: typeof segmentAnnotations) => {
+    const canvas = imageCanvasRef.current;
+    const ctx = canvas?.getContext('2d');
+    if (!canvas || !ctx || !imageData || annotations.length === 0) return;
+
+    const img = new Image();
+    img.onload = () => {
+      canvas.width = img.width;
+      canvas.height = img.height;
+      ctx.drawImage(img, 0, 0);
+
+      const colors = [
+        { border: '#3B82F6', fill: 'rgba(59, 130, 246, 0.15)', label: '#3B82F6' },
+        { border: '#10B981', fill: 'rgba(16, 185, 129, 0.15)', label: '#10B981' },
+        { border: '#F59E0B', fill: 'rgba(245, 158, 11, 0.15)', label: '#F59E0B' },
+        { border: '#EF4444', fill: 'rgba(239, 68, 68, 0.15)', label: '#EF4444' },
+        { border: '#8B5CF6', fill: 'rgba(139, 92, 246, 0.15)', label: '#8B5CF6' },
+      ];
+
+      annotations.forEach((ann, idx) => {
+        const color = colors[idx % colors.length];
+        
+        if (ann.bbox) {
+          const [x1, y1, x2, y2] = ann.bbox;
+          
+          ctx.fillStyle = color.fill;
+          ctx.fillRect(x1, y1, x2 - x1, y2 - y1);
+          
+          ctx.strokeStyle = color.border;
+          ctx.lineWidth = 3;
+          ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+
+          const labelText = ann.confidence 
+            ? `${ann.label} (${(ann.confidence * 100).toFixed(0)}%)`
+            : ann.label;
+          
+          ctx.font = 'bold 14px Arial';
+          const textMetrics = ctx.measureText(labelText);
+          const textWidth = textMetrics.width + 8;
+          const textHeight = 20;
+          
+          ctx.fillStyle = color.label;
+          ctx.fillRect(x1, y1 - textHeight - 4, textWidth, textHeight);
+          
+          ctx.fillStyle = '#FFFFFF';
+          ctx.fillText(labelText, x1 + 4, y1 - 8);
+        }
+      });
+    };
+    img.src = imageData;
+  }, []);
+
+  useEffect(() => {
+    if (segmentAnnotations.length > 0 && currentItem?.imageData) {
+      drawAnnotationsOnCanvas(currentItem.imageData, segmentAnnotations);
+    }
+  }, [segmentAnnotations, currentItem?.imageData, drawAnnotationsOnCanvas]);
+
+  useEffect(() => {
+    if (currentItem?.imageData) {
+      const img = new window.Image();
+      img.onload = () => {
+        setImageDimensions({ width: img.width, height: img.height });
+      };
+      img.src = currentItem.imageData;
+    }
+  }, [currentItem?.imageData]);
+
+  const handleMedicalImageSegment = async () => {
+    if (!currentItem?.imageData || !selectedTemplate) return;
     
-    setLlmLoading(true);
-    setSegmentResult('');
+    setSegmentLoading(true);
+    setSegmentError('');
+    setSegmentAnnotations([]);
     
     try {
-      const visionConfig = selectedTemplate?.llmConfigs?.find(c => c.supportsVision);
-      const visionPrompt = selectedTemplate?.llmPrompts?.find(p => p.forVision);
-      const result = await segmentImage(
-        visionConfig || llmConfig,
-        currentItem.imageData,
-        visionPrompt?.content || '请分析这张图片，识别主要区域和对象。'
+      const visionConfig = selectedTemplate.llmConfigs?.find(c => c.supportsVision);
+      if (!visionConfig) {
+        throw new Error('未配置视觉模型，请在模板中添加支持视觉的模型');
+      }
+      
+      const promptText = globalSegmentPromptOverride || selectedTemplate.globalSegmentPrompt || '分析医学影像，识别主要解剖结构和异常区域，提供详细描述和诊断建议。';
+      
+      const response = await callLLM(
+        visionConfig,
+        [
+          {
+            role: 'system',
+            content: '你是专业医学影像分析助手。分析医学影像，返回JSON格式结果，包含病灶/器官的标注信息。返回格式：{"annotations":[{"label":"病灶名称","description":"详细描述","confidence":0.95}]}',
+          },
+          {
+            role: 'user',
+            content: [
+              { type: 'text', text: promptText },
+              { type: 'image_url', image_url: { url: currentItem.imageData } },
+            ],
+          },
+        ],
+        { jsonMode: true }
       );
       
-      setSegmentResult(JSON.stringify(result, null, 2));
+      const result = JSON.parse(response.content);
       
-      if (result.segments && result.segments.length > 0) {
-        const options = result.segments.map(s => s.label).join(',');
-        console.log('AI建议的标签:', options);
+      if (result.annotations && Array.isArray(result.annotations)) {
+        const annotationsWithBbox = result.annotations.map((ann: any, idx: number) => {
+          if (!ann.bbox && imageDimensions.width > 0 && imageDimensions.height > 0) {
+            const boxWidth = imageDimensions.width * 0.15;
+            const boxHeight = imageDimensions.height * 0.15;
+            const x = (idx % 3) * (imageDimensions.width / 3) + (imageDimensions.width / 6) - (boxWidth / 2);
+            const y = Math.floor(idx / 3) * (imageDimensions.height / 3) + (imageDimensions.height / 6) - (boxHeight / 2);
+            return {
+              ...ann,
+              bbox: [x, y, x + boxWidth, y + boxHeight] as [number, number, number, number]
+            };
+          }
+          return ann;
+        });
+        setSegmentAnnotations(annotationsWithBbox);
+      } else {
+        throw new Error('返回数据格式错误');
       }
     } catch (error) {
-      setSegmentResult('分析失败: ' + (error as Error).message);
+      setSegmentError((error as Error).message);
     } finally {
-      setLlmLoading(false);
+      setSegmentLoading(false);
     }
   };
 
-  const handleGenerateOutput = async () => {
-    if (!formData || Object.keys(formData).length === 0) return;
+  const handleCOTGenerate = async () => {
+    if (!selectedTemplate || !currentItem) return;
     
-    setLlmLoading(true);
-    setOutputResult('');
-    
-    try {
-      const textPrompt = selectedTemplate?.llmPrompts?.find(p => !p.forVision);
-      const result = await generateStructuredOutput(
-        selectedTemplate?.llmConfigs?.[0] || llmConfig,
-        formData,
-        textPrompt?.content || outputTemplate,
-        'json'
-      );
-      
-      setOutputResult(result);
-    } catch (error) {
-      setOutputResult('生成失败: ' + (error as Error).message);
-    } finally {
-      setLlmLoading(false);
-    }
-  };
-
-  const handleBatchOutput = async () => {
-    if (!currentStorage?.results.length) return;
-    
-    setLlmLoading(true);
-    setOutputResult('');
+    setCotLoading(true);
+    setCotError('');
     
     try {
-      const allResults = currentStorage.results.map(r => ({
-        fileName: currentStorage.items.find(i => i.id === r.itemId)?.fileName,
-        ...r.data
-      }));
+      const config = selectedTemplate.llmConfigs?.[0] || llmConfig;
+      const visionConfig = selectedTemplate.llmConfigs?.find(c => c.supportsVision);
       
-      const textPrompt = selectedTemplate?.llmPrompts?.find(p => !p.forVision);
-      const result = await generateStructuredOutput(
-        selectedTemplate?.llmConfigs?.[0] || llmConfig,
-        { items: allResults },
-        textPrompt?.content || outputTemplate,
-        'json'
-      );
+      const updates: Record<string, string | string[]> = {};
+      const promptText = globalCOTPromptOverride || selectedTemplate.globalCOTPrompt || '';
       
-      setOutputResult(result);
+      for (const field of selectedTemplate.fields) {
+        let messages = [];
+        
+        if (selectedTemplate.dataType === 'image' && currentItem.imageData && visionConfig) {
+          const systemPrompt = promptText || '你是医学数据标注助手，根据医学影像分析结果生成结构化标注内容。';
+          const userPrompt = `请为字段"${field.label}"生成标注内容。`;
+          
+          messages = [
+            { role: 'system' as const, content: systemPrompt },
+            {
+              role: 'user' as const,
+              content: [
+                { type: 'text' as const, text: userPrompt },
+                { type: 'image_url' as const, image_url: { url: currentItem.imageData } },
+              ],
+            },
+          ];
+          
+          const response = await callLLM(visionConfig, messages);
+          updates[field.id] = response.content.trim();
+        } else if (selectedTemplate.dataType === 'text' && currentItem.content) {
+          const systemPrompt = promptText || '你是医学数据标注助手，根据文本内容生成结构化标注内容。';
+          const userPrompt = `请为字段"${field.label}"生成标注内容。\n\n文本内容：\n${currentItem.content}`;
+          
+          messages = [
+            { role: 'system' as const, content: systemPrompt },
+            { role: 'user' as const, content: userPrompt },
+          ];
+          
+          const response = await callLLM(config, messages);
+          updates[field.id] = response.content.trim();
+        }
+      }
+      
+      setFormData(prev => ({ ...prev, ...updates }));
     } catch (error) {
-      setOutputResult('生成失败: ' + (error as Error).message);
+      setCotError((error as Error).message);
     } finally {
-      setLlmLoading(false);
+      setCotLoading(false);
     }
   };
 
@@ -1087,12 +1382,24 @@ const Workspace: React.FC = () => {
                 <div className="flex-1 overflow-auto flex items-center justify-center">
                   {selectedTemplate.dataType === 'image' ? (
                     currentItem?.imageData ? (
-                      <img 
-                        src={currentItem.imageData} 
-                        alt={currentItem.fileName}
-                        className="max-w-full h-auto rounded-lg shadow-lg transition-transform"
-                        style={{ transform: `scale(${imageZoom})` }}
-                      />
+                      <div className="relative inline-block">
+                        <img 
+                          src={currentItem.imageData} 
+                          alt={currentItem.fileName}
+                          className="max-w-full h-auto rounded-lg shadow-lg"
+                          style={{ 
+                            transform: `scale(${imageZoom})`,
+                            display: segmentAnnotations.length > 0 ? 'none' : 'block'
+                          }}
+                        />
+                        {segmentAnnotations.length > 0 && (
+                          <canvas
+                            ref={imageCanvasRef}
+                            className="max-w-full h-auto rounded-lg shadow-lg"
+                            style={{ transform: `scale(${imageZoom})` }}
+                          />
+                        )}
+                      </div>
                     ) : currentItem ? (
                       <div className="flex flex-col items-center gap-3 text-muted-foreground">
                         <Loader2Icon className="animate-spin" size={32} />
@@ -1129,31 +1436,118 @@ const Workspace: React.FC = () => {
             )}
           </div>
 
-          <div className="w-[400px] bg-card p-6 overflow-y-auto shrink-0">
-            <h2 className="text-lg font-bold mb-6 pb-4 border-b border-border">
-              标注信息
-            </h2>
+          <div className="w-[420px] bg-white overflow-y-auto shrink-0 flex flex-col border-l border-gray-200">
+            <div className="p-4 border-b border-gray-200 bg-[#F5F7FA]">
+              <h2 className="text-lg font-bold flex items-center gap-2 text-gray-800">
+                <div className="w-8 h-8 rounded-lg flex items-center justify-center" style={{backgroundColor: 'rgba(22, 93, 255, 0.1)'}}>
+                  <CheckSquareIcon style={{color: '#165DFF'}} size={18} />
+                </div>
+                医学标注面板
+              </h2>
+            </div>
 
-            {currentItem ? (
-              <>
-                <div className="space-y-6">
+            <div className="flex-1 overflow-y-auto p-4 space-y-4">
+              {selectedTemplate.dataType === 'image' && selectedTemplate.llmConfigs?.some(c => c.supportsVision) && selectedTemplate.useLLM && (
+                <div className="bg-[#F5F7FA] rounded-lg border border-gray-300 p-4">
+                  <div className="flex items-center gap-2 mb-3">
+                    <div className="w-7 h-7 rounded-md flex items-center justify-center" style={{backgroundColor: '#165DFF'}}>
+                      <ImageIcon className="text-white" size={14} />
+                    </div>
+                    <h3 className="text-base font-bold text-gray-800">医学影像分割</h3>
+                  </div>
+                  
+                  <p className="text-xs text-gray-600 mb-3">
+                    自动识别病灶/器官位置，生成可视化标注框
+                  </p>
+                  
+                  <div className="space-y-2 mb-3">
+                    <Label className="text-xs font-semibold text-gray-700">分割提示词</Label>
+                    <Textarea
+                      placeholder={selectedTemplate.globalSegmentPrompt || '输入影像分割提示词...'}
+                      className="min-h-[60px] resize-none text-xs bg-white border-gray-300 text-gray-800"
+                      value={globalSegmentPromptOverride}
+                      onChange={e => setGlobalSegmentPromptOverride(e.target.value)}
+                    />
+                  </div>
+                  
+                  <Button
+                    className="w-full h-9 text-white text-sm font-semibold shadow-sm hover:opacity-90"
+                    style={{backgroundColor: '#165DFF'}}
+                    onClick={handleMedicalImageSegment}
+                    disabled={segmentLoading || !currentItem?.imageData}
+                  >
+                    {segmentLoading ? (
+                      <>
+                        <Loader2Icon className="animate-spin mr-2" size={14} />
+                        执行分割中...
+                      </>
+                    ) : (
+                      <>
+                        <ImageIcon className="mr-2" size={14} />
+                        执行影像分割
+                      </>
+                    )}
+                  </Button>
+                  
+                  {segmentError && (
+                    <div className="mt-2.5 p-2.5 bg-red-50 border border-red-200 rounded-md text-xs text-red-700">
+                      ⚠️ {segmentError}
+                    </div>
+                  )}
+                  
+                  {segmentAnnotations.length > 0 && (
+                    <div className="mt-2.5 p-2.5 bg-white border border-gray-300 rounded-md shadow-sm">
+                      <div className="text-xs font-bold text-gray-800 mb-1.5">
+                        ✓ 识别完成 ({segmentAnnotations.length} 个区域)
+                      </div>
+                      <div className="space-y-1 max-h-24 overflow-y-auto">
+                        {segmentAnnotations.map((ann, idx) => (
+                          <div key={idx} className="flex items-center gap-2 text-xs text-gray-700">
+                            <div className="w-1.5 h-1.5 rounded-full" style={{backgroundColor: '#165DFF'}} />
+                            <span className="font-medium">{ann.label}</span>
+                            {ann.confidence && (
+                              <span style={{color: '#165DFF'}}>({(ann.confidence * 100).toFixed(0)}%)</span>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              <div className="bg-[#F5F7FA] rounded-lg border border-gray-300 p-4">
+                <div className="flex items-center gap-2 mb-3">
+                  <div className="w-7 h-7 rounded-md bg-gray-600 flex items-center justify-center">
+                    <CheckCircle2Icon className="text-white" size={14} />
+                  </div>
+                  <h3 className="text-base font-bold text-gray-800">标注信息录入</h3>
+                </div>
+                
+                <div className="space-y-4">
                   {selectedTemplate.fields.map(field => (
-                    <div key={field.id} className="space-y-3">
-                      <Label className="text-base font-semibold">
+                    <div key={field.id} className="space-y-2">
+                      <Label className="text-sm font-semibold flex items-center gap-2">
                         {field.label}
                         {field.type === 'checkbox' && (
-                          <span className="text-xs font-normal text-muted-foreground ml-2">(可多选)</span>
+                          <span className="text-xs font-normal text-muted-foreground">(可多选)</span>
+                        )}
+                        {field.enableLLM && (
+                          <span className="px-1.5 py-0.5 rounded text-xs font-medium flex items-center gap-1" style={{backgroundColor: 'rgba(22, 93, 255, 0.1)', color: '#165DFF'}}>
+                            <BotIcon size={10} />
+                            AI
+                          </span>
                         )}
                       </Label>
 
                       {field.type === 'checkbox' && field.options && (
-                        <div className="grid grid-cols-2 gap-3">
+                        <div className="grid grid-cols-2 gap-2">
                           {field.options.split(',').map(opt => {
                             const trimmed = opt.trim();
                             return (
                               <div 
                                 key={trimmed}
-                                className="flex items-center space-x-2 p-2.5 rounded-lg border border-border bg-secondary/30 hover:bg-secondary/60 transition-colors"
+                                className="flex items-center space-x-2 p-2 rounded-md border border-gray-200 bg-gray-50 hover:bg-gray-100 transition-colors"
                               >
                                 <Checkbox
                                   id={`${field.id}-${trimmed}`}
@@ -1162,7 +1556,7 @@ const Workspace: React.FC = () => {
                                 />
                                 <Label
                                   htmlFor={`${field.id}-${trimmed}`}
-                                  className="flex-1 cursor-pointer text-sm"
+                                  className="flex-1 cursor-pointer text-xs"
                                 >
                                   {trimmed}
                                 </Label>
@@ -1175,7 +1569,7 @@ const Workspace: React.FC = () => {
                       {field.type === 'richtext' && (
                         <Textarea
                           placeholder="请输入..."
-                          className="min-h-[120px] resize-y"
+                          className="min-h-[100px] resize-y text-sm"
                           value={formData[field.id] || ''}
                           onChange={e => handleFieldChange(field.id, e.target.value)}
                         />
@@ -1184,6 +1578,7 @@ const Workspace: React.FC = () => {
                       {field.type === 'text' && (
                         <Input
                           placeholder="请输入..."
+                          className="text-sm h-9"
                           value={formData[field.id] || ''}
                           onChange={e => handleFieldChange(field.id, e.target.value)}
                         />
@@ -1191,85 +1586,79 @@ const Workspace: React.FC = () => {
                     </div>
                   ))}
                 </div>
-
-                {selectedTemplate.useLLM && (
-                  <div className="mt-6 pt-6 border-t border-border space-y-3">
-                    <div className="flex items-center justify-between">
-                      <Label className="text-base font-semibold flex items-center gap-2">
-                        <SparklesIcon size={16} />
-                        AI 辅助
-                      </Label>
-                      <Button 
-                        variant="ghost" 
-                        size="sm"
-                        onClick={() => setShowLLMSettings(true)}
-                      >
-                        设置
-                      </Button>
-                    </div>
-                    
-                    {selectedTemplate.dataType === 'image' && selectedTemplate.llmConfigs?.some(c => c.supportsVision) && (
-                      <Button 
-                        variant="outline" 
-                        className="w-full"
-                        onClick={handleAISegment}
-                        disabled={llmLoading || !currentItem?.imageData}
-                      >
-                        {llmLoading ? (
-                          <>
-                            <Loader2Icon className="animate-spin mr-2" size={14} />
-                            分析中...
-                          </>
-                        ) : (
-                          <>
-                            <ImageIcon className="mr-2" size={14} />
-                            AI 图片分析
-                          </>
-                        )}
-                      </Button>
-                    )}
-                    
-                    {segmentResult && (
-                      <div className="p-3 bg-secondary/50 rounded-lg text-xs font-mono whitespace-pre-wrap max-h-40 overflow-auto">
-                        {segmentResult}
-                      </div>
-                    )}
-                    
-                    <Button 
-                      variant="outline" 
-                      className="w-full"
-                      onClick={() => setShowOutputDialog(true)}
-                      disabled={llmLoading || Object.keys(formData).length === 0}
-                    >
-                      <FileJsonIcon className="mr-2" size={14} />
-                      生成结构化输出
-                    </Button>
-                  </div>
-                )}
-
-                <div className="mt-8 pt-6 border-t border-border space-y-3">
-                  <Button 
-                    className="w-full h-11"
-                    onClick={handleMarkAnnotated}
-                    disabled={currentItem.status === 'annotated'}
-                  >
-                    {currentItem.status === 'annotated' ? '已完成标注' : '标记为已标注'}
-                  </Button>
-                  <Button 
-                    variant="outline" 
-                    className="w-full"
-                    onClick={() => navigateItem('next')}
-                    disabled={currentIndex >= totalItems - 1}
-                  >
-                    下一条
-                  </Button>
-                </div>
-              </>
-            ) : (
-              <div className="text-center text-muted-foreground py-12">
-                暂无数据
               </div>
-            )}
+
+              {selectedTemplate.useLLM && (
+                <div className="bg-[#F5F7FA] rounded-lg border border-gray-300 p-4">
+                  <div className="flex items-center gap-2 mb-3">
+                    <div className="w-7 h-7 rounded-md flex items-center justify-center" style={{backgroundColor: '#165DFF'}}>
+                      <SparklesIcon className="text-white" size={14} />
+                    </div>
+                    <h3 className="text-base font-bold text-gray-800">COT 标注生成</h3>
+                  </div>
+                  
+                  <p className="text-xs text-gray-600 mb-3">
+                    按模板配置智能填充标注项，结果自动写入对应输入框
+                  </p>
+                  
+                  <div className="space-y-2 mb-3">
+                    <Label className="text-xs font-semibold text-gray-700">生成提示词</Label>
+                    <Textarea
+                      placeholder={selectedTemplate.globalCOTPrompt || '输入标注生成提示词...'}
+                      className="min-h-[60px] resize-none text-xs bg-white border-gray-300 text-gray-800"
+                      value={globalCOTPromptOverride}
+                      onChange={e => setGlobalCOTPromptOverride(e.target.value)}
+                    />
+                  </div>
+                  
+                  <Button
+                    className="w-full h-9 text-white text-sm font-semibold shadow-sm hover:opacity-90"
+                    style={{backgroundColor: '#165DFF'}}
+                    onClick={handleCOTGenerate}
+                    disabled={cotLoading}
+                  >
+                    {cotLoading ? (
+                      <>
+                        <Loader2Icon className="animate-spin mr-2" size={14} />
+                        生成标注中...
+                      </>
+                    ) : (
+                      <>
+                        <SparklesIcon className="mr-2" size={14} />
+                        生成标注内容
+                      </>
+                    )}
+                  </Button>
+                  
+                  {cotError && (
+                    <div className="mt-2.5 p-2.5 bg-red-50 border border-red-200 rounded-md text-xs text-red-700">
+                      ⚠️ {cotError}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
+            <div className="p-4 border-t border-gray-200 bg-[#F5F7FA]">
+              <div className="flex gap-2">
+                <Button 
+                  className="flex-1 h-10 text-white font-semibold"
+                  style={{backgroundColor: '#165DFF'}}
+                  onClick={handleMarkAnnotated}
+                  disabled={currentItem?.status === 'annotated'}
+                >
+                  {currentItem?.status === 'annotated' ? '✓ 已完成' : '标记完成'}
+                </Button>
+                <Button 
+                  variant="outline" 
+                  className="flex-1 h-10 border-gray-300 text-gray-700 hover:bg-gray-100"
+                  onClick={() => navigateItem('next')}
+                  disabled={currentIndex >= totalItems - 1}
+                >
+                  下一条 →
+                </Button>
+              </div>
+            </div>
           </div>
         </div>
       </div>
@@ -1280,56 +1669,6 @@ const Workspace: React.FC = () => {
             <DialogTitle>大模型配置</DialogTitle>
           </DialogHeader>
           <LLMSettings value={llmConfig} onChange={setLlmConfig} dataType={selectedTemplate?.dataType || 'text'} />
-        </DialogContent>
-      </Dialog>
-
-      <Dialog open={showOutputDialog} onOpenChange={setShowOutputDialog}>
-        <DialogContent className="max-w-2xl">
-          <DialogHeader>
-            <DialogTitle>生成结构化输出</DialogTitle>
-          </DialogHeader>
-          <div className="space-y-4">
-            <div className="space-y-2">
-              <Label>输出模板/提示词</Label>
-              <Textarea
-                value={outputTemplate}
-                onChange={e => setOutputTemplate(e.target.value)}
-                placeholder="输入输出格式要求或模板..."
-                className="min-h-[80px]"
-              />
-            </div>
-            
-            <div className="flex gap-2">
-              <Button onClick={handleGenerateOutput} disabled={llmLoading}>
-                {llmLoading ? (
-                  <>
-                    <Loader2Icon className="animate-spin mr-2" size={14} />
-                    生成中...
-                  </>
-                ) : (
-                  '生成当前项'
-                )}
-              </Button>
-              <Button variant="outline" onClick={handleBatchOutput} disabled={llmLoading}>
-                生成全部 ({currentStorage?.results.length || 0} 条)
-              </Button>
-            </div>
-            
-            {outputResult && (
-              <div className="p-4 bg-secondary/50 rounded-lg">
-                <pre className="text-xs font-mono whitespace-pre-wrap max-h-[400px] overflow-auto">
-                  {outputResult}
-                </pre>
-              </div>
-            )}
-          </div>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => {
-              navigator.clipboard.writeText(outputResult);
-            }} disabled={!outputResult}>
-              复制结果
-            </Button>
-          </DialogFooter>
         </DialogContent>
       </Dialog>
     </div>

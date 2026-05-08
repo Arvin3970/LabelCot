@@ -45,10 +45,12 @@ const TemplateBuilder: React.FC = () => {
   const [editingTemplateId, setEditingTemplateId] = useState<string | null>(null);
   const [templateName, setTemplateName] = useState('');
   const [description, setDescription] = useState('');
-  const [dataType, setDataType] = useState<DataType>('text');
+  const [dataType, setDataType] = useState<DataType | null>(null);
   const [useLLM, setUseLLM] = useState(false);
   const [llmConfigs, setLlmConfigs] = useState<LLMConfig[]>([]);
   const [llmPrompts, setLlmPrompts] = useState<LLMPrompt[]>([]);
+  const [globalSegmentPrompt, setGlobalSegmentPrompt] = useState<string>('');
+  const [globalCOTPrompt, setGlobalCOTPrompt] = useState<string>('');
   const [fields, setFields] = useState<TemplateField[]>([
     { id: 'f1', type: 'checkbox', label: '情感极性', options: '正面, 负面, 中性' }
   ]);
@@ -60,12 +62,14 @@ const TemplateBuilder: React.FC = () => {
       setEditingTemplateId(t.id);
       setTemplateName(t.name.replace(' (副本)', ''));
       setDescription(t.desc || '');
-      setDataType(t.dataType || 'text');
+      setDataType(t.dataType || null);
       setUseLLM(t.llm || false);
       const loadedFields = t.fieldDetails || t.fields;
       setFields(loadedFields && loadedFields.length > 0 ? loadedFields : [{ id: 'f1', type: 'checkbox', label: '情感极性', options: '正面, 负面, 中性' }]);
       setLlmConfigs(t.llmConfigs && t.llmConfigs.length > 0 ? t.llmConfigs : []);
       setLlmPrompts(t.llmPrompts && t.llmPrompts.length > 0 ? t.llmPrompts : []);
+      setGlobalSegmentPrompt(t.globalSegmentPrompt || '');
+      setGlobalCOTPrompt(t.globalCOTPrompt || '');
     }
   }, [location.state]);
 
@@ -222,6 +226,11 @@ const TemplateBuilder: React.FC = () => {
       return;
     }
     
+    if (!dataType) {
+      alert('请选择数据类型（文本标注或图片标注）');
+      return;
+    }
+    
     const templates = loadTemplates();
     const newTemplate = {
       id: editingTemplateId || Date.now().toString(),
@@ -230,10 +239,12 @@ const TemplateBuilder: React.FC = () => {
       llm: useLLM,
       fields: fields.length,
       date: new Date().toISOString().slice(0, 10),
-      dataType,
+      dataType: dataType!,
       fieldDetails: fields,
       llmConfigs,
       llmPrompts,
+      globalSegmentPrompt,
+      globalCOTPrompt,
       status: 'draft',
     };
 
@@ -256,6 +267,11 @@ const TemplateBuilder: React.FC = () => {
       return;
     }
     
+    if (!dataType) {
+      alert('请选择数据类型（文本标注或图片标注）');
+      return;
+    }
+    
     const templates = loadTemplates();
     const newTemplate = {
       id: editingTemplateId || Date.now().toString(),
@@ -264,10 +280,12 @@ const TemplateBuilder: React.FC = () => {
       llm: useLLM,
       fields: fields.length,
       date: new Date().toISOString().slice(0, 10),
-      dataType,
+      dataType: dataType!,
       fieldDetails: fields,
       llmConfigs,
       llmPrompts,
+      globalSegmentPrompt,
+      globalCOTPrompt,
       status: 'published',
     };
 
@@ -288,7 +306,7 @@ const TemplateBuilder: React.FC = () => {
     const exportData: AnnotationTemplate = {
       id: Date.now().toString(),
       name: templateName,
-      dataType,
+      dataType: dataType!,
       fields,
       createdAt: new Date().toISOString().slice(0, 10),
       useLLM,
@@ -389,16 +407,22 @@ const TemplateBuilder: React.FC = () => {
             </div>
             
             <div className="space-y-2">
-              <Label>数据类型</Label>
+              <Label className="flex items-center gap-1">
+                数据类型
+                <span className="text-destructive">*</span>
+              </Label>
               <div className="flex gap-3">
                 <button
                   type="button"
                   onClick={() => setDataType('text')}
                   className={`flex-1 flex items-center gap-2 p-3 rounded-lg border transition-all ${
                     dataType === 'text' 
-                      ? 'border-primary bg-primary/5 text-primary' 
-                      : 'border-border hover:border-primary/50'
+                      ? 'border-[#165DFF] text-[#165DFF]' 
+                      : !dataType 
+                        ? 'border-red-300 hover:border-red-400 bg-red-50'
+                        : 'border-gray-300 hover:border-[#165DFF]'
                   }`}
+                  style={dataType === 'text' ? {backgroundColor: 'rgba(22, 93, 255, 0.05)'} : {}}
                 >
                   <FileTextIcon size={18} />
                   <span className="font-medium">文本标注</span>
@@ -408,22 +432,31 @@ const TemplateBuilder: React.FC = () => {
                   onClick={() => setDataType('image')}
                   className={`flex-1 flex items-center gap-2 p-3 rounded-lg border transition-all ${
                     dataType === 'image' 
-                      ? 'border-primary bg-primary/5 text-primary' 
-                      : 'border-border hover:border-primary/50'
+                      ? 'border-[#165DFF] text-[#165DFF]' 
+                      : !dataType 
+                        ? 'border-red-300 hover:border-red-400 bg-red-50'
+                        : 'border-gray-300 hover:border-[#165DFF]'
                   }`}
+                  style={dataType === 'image' ? {backgroundColor: 'rgba(22, 93, 255, 0.05)'} : {}}
                 >
                   <ImageIcon size={18} />
                   <span className="font-medium">图片标注</span>
                 </button>
               </div>
+              {!dataType && (
+                <p className="text-sm text-destructive flex items-center gap-1">
+                  <XCircleIcon size={14} />
+                  请选择数据类型（必填项）
+                </p>
+              )}
             </div>
           </div>
 
-          <div className="space-y-4 p-5 bg-secondary/50 rounded-xl border border-border">
+          <div className="space-y-4 p-5 bg-[#F5F7FA] rounded-xl border border-gray-300">
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">
-                <div className="p-1.5 bg-primary/10 rounded-md">
-                  <BotIcon className="text-primary" size={18} />
+                <div className="p-1.5 rounded-md" style={{backgroundColor: 'rgba(22, 93, 255, 0.1)'}}>
+                  <BotIcon style={{color: '#165DFF'}} size={18} />
                 </div>
                 <div>
                   <Label className="text-base font-semibold">大模型辅助 (LLM)</Label>
@@ -435,6 +468,46 @@ const TemplateBuilder: React.FC = () => {
             
             {useLLM && (
               <div className="pt-2 space-y-5 animate-in slide-in-from-top-2 duration-300">
+                <div className="p-4 bg-[#F5F7FA] rounded-lg border border-gray-300">
+                  <div className="flex items-center gap-2 mb-3">
+                    <MessageSquareIcon style={{color: '#165DFF'}} size={18} />
+                    <Label className="text-base font-bold text-gray-800">全局 AI 提示词配置</Label>
+                  </div>
+                  <p className="text-xs text-gray-600 mb-4">
+                    在此统一配置 AI 辅助规则，标注时可全局微调，所有字段共享此配置
+                  </p>
+                  
+                  {dataType === 'image' && (
+                    <div className="space-y-3 mb-4">
+                      <div className="flex items-center gap-2">
+                        <div className="w-2 h-2 rounded-full" style={{backgroundColor: '#165DFF'}} />
+                        <Label className="text-sm font-semibold text-gray-700">医学影像辅助分割提示词</Label>
+                      </div>
+                      <Textarea
+                        placeholder="例如：分析乳腺超声图像，识别并标注病灶位置、大小、形态、BI-RADS分级等关键信息..."
+                        className="min-h-[100px] font-mono text-sm resize-y bg-white border-gray-300 text-gray-800"
+                        value={globalSegmentPrompt}
+                        onChange={e => setGlobalSegmentPrompt(e.target.value)}
+                      />
+                      <p className="text-xs text-gray-600">用于自动识别病灶/器官，生成可视化标注框</p>
+                    </div>
+                  )}
+                  
+                  <div className="space-y-3">
+                    <div className="flex items-center gap-2">
+                      <div className="w-2 h-2 rounded-full" style={{backgroundColor: '#165DFF'}} />
+                      <Label className="text-sm font-semibold text-gray-700">COT 标注生成提示词</Label>
+                    </div>
+                    <Textarea
+                      placeholder="例如：根据医学影像分析结果，按照标注模板规范生成结构化标注内容，包括病灶描述、诊断建议等..."
+                      className="min-h-[100px] font-mono text-sm resize-y bg-white border-gray-300 text-gray-800"
+                      value={globalCOTPrompt}
+                      onChange={e => setGlobalCOTPrompt(e.target.value)}
+                    />
+                    <p className="text-xs text-gray-600">用于按模板自动填充所有标注字段</p>
+                  </div>
+                </div>
+
                 <div className="space-y-3">
                   <div className="flex items-center justify-between">
                     <Label className="text-sm">模型配置</Label>
@@ -720,59 +793,6 @@ const TemplateBuilder: React.FC = () => {
                         />
                       </div>
                     )}
-                    
-                    {useLLM && llmConfigs.length > 0 && (
-                      <div className="space-y-3 pt-3 border-t border-border/50">
-                        <div className="flex items-center justify-between">
-                          <div className="flex items-center gap-2">
-                            <Switch 
-                              checked={field.enableLLM || false}
-                              onCheckedChange={(checked) => updateField(field.id, 'enableLLM', checked)}
-                            />
-                            <Label className="text-xs">启用大模型优化</Label>
-                          </div>
-                        </div>
-                        
-                        {field.enableLLM && (
-                          <div className="space-y-3 pl-2 animate-in slide-in-from-top-2 duration-200">
-                            <div className="flex gap-4">
-                              <div className="flex-1 space-y-2">
-                                <Label className="text-xs text-muted-foreground">选择提示词</Label>
-                                <Select
-                                  value={field.llmPromptId || ''}
-                                  onValueChange={(val) => updateField(field.id, 'llmPromptId', val)}
-                                >
-                                  <SelectTrigger className="h-9">
-                                    <SelectValue placeholder="选择提示词" />
-                                  </SelectTrigger>
-                                  <SelectContent>
-                                    {llmPrompts.map(p => (
-                                      <SelectItem key={p.id} value={p.id}>
-                                        {p.name}
-                                        {p.forVision && <span className="ml-1 text-primary">(视觉)</span>}
-                                      </SelectItem>
-                                    ))}
-                                    {llmPrompts.length === 0 && (
-                                      <SelectItem value="_none" disabled>请先添加提示词</SelectItem>
-                                    )}
-                                  </SelectContent>
-                                </Select>
-                              </div>
-                              <div className="flex items-end gap-2 pb-1">
-                                <Switch 
-                                  checked={field.readonly || false}
-                                  onCheckedChange={(checked) => updateField(field.id, 'readonly', checked)}
-                                />
-                                <Label className="text-xs text-muted-foreground">结果不可修改</Label>
-                              </div>
-                            </div>
-                            <p className="text-xs text-muted-foreground">
-                              大模型将根据提示词生成内容并填充到此字段
-                            </p>
-                          </div>
-                        )}
-                      </div>
-                    )}
                   </CardContent>
                 </Card>
               ))}
@@ -786,13 +806,13 @@ const TemplateBuilder: React.FC = () => {
           </div>
         </div>
         
-        <div className="p-6 border-t border-border bg-card">
+        <div className="p-6 border-t border-gray-200 bg-white">
           <div className="flex gap-3">
-            <Button variant="outline" className="flex-1 flex gap-2 h-11 text-base" onClick={handleSave}>
+            <Button variant="outline" className="flex-1 flex gap-2 h-11 text-base border-gray-300" onClick={handleSave}>
               <SaveIcon size={18} />
               保存草稿
             </Button>
-            <Button className="flex-1 flex gap-2 h-11 text-base" onClick={handlePublish}>
+            <Button className="flex-1 flex gap-2 h-11 text-base text-white font-semibold" style={{backgroundColor: '#165DFF'}} onClick={handlePublish}>
               <SaveIcon size={18} />
               发布模板
             </Button>
@@ -845,15 +865,16 @@ const TemplateBuilder: React.FC = () => {
                     )}
                     
                     {field.enableLLM && (
-                      <div className="mt-3 pt-3 border-t border-dashed border-border space-y-2">
-                        <Label className="text-xs text-primary flex items-center gap-1">
+                      <div className="mt-3 pt-3 border-t border-dashed border-gray-300 space-y-2">
+                        <Label className="text-xs flex items-center gap-1" style={{color: '#165DFF'}}>
                           <BotIcon size={12} />
                           大模型优化
                         </Label>
                         <Textarea 
                           placeholder="大模型将根据提示词生成内容..."
                           disabled 
-                          className="min-h-[80px] bg-primary/5 border-primary/30 text-primary/70" 
+                          className="min-h-[80px] border-gray-300"
+                          style={{backgroundColor: 'rgba(22, 93, 255, 0.05)'}}
                         />
                       </div>
                     )}

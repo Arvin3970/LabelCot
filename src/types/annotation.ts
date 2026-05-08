@@ -46,6 +46,8 @@ export interface AnnotationTemplate {
   useLLM?: boolean;
   llmConfigs?: LLMConfig[];
   llmPrompts?: LLMPrompt[];
+  globalSegmentPrompt?: string;
+  globalCOTPrompt?: string;
 }
 
 export interface FileNode {
@@ -63,6 +65,7 @@ export interface DatasetItem {
   id: string;
   content?: string;
   imageData?: string;
+  textContent?: string;
   fileName: string;
   status: 'pending' | 'annotated';
   templateId?: string;
