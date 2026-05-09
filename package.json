@@ -1,16 +1,18 @@
 {
-  "name": "react-ts-demo",
+  "name": "labelcot",
   "private": true,
-  "version": "0.0.0",
+  "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "build": "vite build",
-    "build:dev": "vite build --mode development",
     "dev": "concurrently \"npm run dev:client\" \"npm run dev:proxy\"",
     "dev:client": "vite",
     "dev:proxy": "node server/proxy.js",
-    "lint": "eslint .",
-    "preview": "vite preview"
+    "build": "vite build",
+    "build:dev": "vite build --mode development",
+    "build:prod": "vite build --mode production",
+    "preview": "vite preview",
+    "start": "node server/production.js",
+    "lint": "eslint ."
   },
   "dependencies": {
     "@hookform/resolvers": "^5.2.2",
